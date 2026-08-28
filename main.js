@@ -263,6 +263,158 @@ function ensureMusicSuffix(url) {
   }
 }
 
+// 验证目标地址是否为飞牛音乐服务
+// 在 loadURL 之前做一次 HTTP 请求探测，避免直接加载 502 / 非飞牛音乐页面导致卡死
+// 返回 { ok: true } 或 { ok: false, error: string }
+// 使用原生 http/https 模块而不是 fetch，确保能控制 SSL 证书验证（fnos.net/局域网 IP 允许自签）
+function verifyFnMusic(targetUrl) {
+  return new Promise((resolve) => {
+    const MAX_REDIRECTS = 10;
+    const TIMEOUT_MS = 12000;
+
+    // 递归实现重定向跟随
+    function doRequest(currentUrl, redirectLeft) {
+      let parsed;
+      try {
+        parsed = new URL(currentUrl);
+      } catch {
+        resolve({ ok: false, error: '地址格式无效' });
+        return;
+      }
+
+      const isHttps = parsed.protocol === 'https:';
+      const host = parsed.hostname;
+      const isHttpsRelay = host.endsWith('.fnos.net');
+      const isLanIp = /^\d+\.\d+\.\d+\.\d+$/.test(host);
+      const mod = isHttps ? https : require('http');
+
+      const options = {
+        hostname: host,
+        port: parsed.port || (isHttps ? 443 : 80),
+        path: parsed.pathname + parsed.search,
+        method: 'GET',
+        headers: {
+          'User-Agent': UA,
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        },
+        timeout: TIMEOUT_MS
+      };
+      // fnos.net 中转与局域网 IP：与 certificate-error 事件保持一致，允许自签 / 过期证书
+      if (isHttps && (isHttpsRelay || isLanIp)) {
+        options.rejectUnauthorized = false;
+      }
+
+      const req = mod.request(options, (res) => {
+        const status = res.statusCode || 0;
+
+        // 处理重定向
+        if (status >= 300 && status < 400 && res.headers.location && redirectLeft > 0) {
+          let next;
+          try {
+            next = new URL(res.headers.location, currentUrl).href;
+          } catch {
+            // 重定向地址无效，直接使用当前状态判断
+            next = null;
+          }
+          if (next) {
+            // 消费掉当前响应避免内存泄漏
+            res.resume();
+            doRequest(next, redirectLeft - 1);
+            return;
+          }
+        }
+
+        // 按状态码快速分类错误
+        if (status === 502) {
+          res.resume();
+          resolve({ ok: false, error: '飞牛 NAS 上未安装或未启动飞牛音乐，请先在 NAS 中安装飞牛音乐插件' });
+          return;
+        }
+        if (status >= 500 && status < 600) {
+          res.resume();
+          resolve({ ok: false, error: '服务器错误（' + status + '），飞牛音乐服务异常，请稍后再试' });
+          return;
+        }
+        if (status === 404 || status === 403) {
+          res.resume();
+          resolve({ ok: false, error: '未检测到飞牛音乐服务，请确认地址正确且飞牛 NAS 上已安装飞牛音乐' });
+          return;
+        }
+
+        // 读取响应正文（限制大小为 2MB，防止下载大文件卡死）
+        const MAX_BODY = 2 * 1024 * 1024;
+        const chunks = [];
+        let total = 0;
+        res.on('data', (c) => {
+          total += c.length;
+          if (total > MAX_BODY) {
+            // 超限：认为页面存在，不再继续校验（SPA 首屏通常 < 500KB）
+            res.destroy();
+            // 超限且状态码正常 → 认为是合法服务
+            if (status >= 200 && status < 400) resolve({ ok: true });
+            else resolve({ ok: false, error: '服务器响应过大，无法校验' });
+            return;
+          }
+          chunks.push(c);
+        });
+        res.on('end', () => {
+          let bodyText;
+          try {
+            bodyText = Buffer.concat(chunks).toString('utf-8');
+          } catch {
+            bodyText = '';
+          }
+          console.log('[verifyFnMusic] status:', status, 'url:', currentUrl, 'bodyLen:', bodyText.length);
+
+          const lower = bodyText.toLowerCase();
+          const hasMusicMarkers =
+            lower.indexOf('飞牛音乐') >= 0 ||
+            lower.indexOf('fnmusic') >= 0 ||
+            lower.indexOf('fnos-music') >= 0 ||
+            lower.indexOf('music center') >= 0 ||
+            lower.indexOf('音乐中心') >= 0 ||
+            /\/music\/assets\//.test(lower) ||
+            /\/music\/_nuxt\//.test(lower) ||
+            /\/music\/static\//.test(lower) ||
+            (lower.indexOf('login') >= 0 &&
+              lower.indexOf('password') >= 0 &&
+              (lower.indexOf('/music') >= 0 || lower.indexOf('音乐') >= 0));
+
+          if (status >= 200 && status < 400 && !hasMusicMarkers) {
+            resolve({ ok: false, error: '该地址不是飞牛音乐服务，请检查地址是否正确' });
+            return;
+          }
+          resolve({ ok: true });
+        });
+        res.on('error', (e) => {
+          console.log('[verifyFnMusic] response error:', e.message);
+          resolve({ ok: false, error: '读取响应失败：' + (e.message || '未知错误') });
+        });
+      });
+
+      req.on('timeout', () => {
+        req.destroy(new Error('timeout'));
+      });
+      req.on('error', (e) => {
+        console.log('[verifyFnMusic] request error:', e.message, 'url:', currentUrl);
+        // 网络错误 / 超时 / 证书错误（非白名单域名）
+        if (e.message && /certificate|ssl|tls/i.test(e.message)) {
+          resolve({ ok: false, error: '服务器证书验证失败，无法安全连接' });
+          return;
+        }
+        if (e.message === 'timeout') {
+          resolve({ ok: false, error: '连接超时，请检查服务器地址或网络' });
+          return;
+        }
+        resolve({ ok: false, error: '无法连接到服务器，请检查地址或网络' });
+      });
+      req.end();
+    }
+
+    doRequest(targetUrl, MAX_REDIRECTS);
+  });
+}
+
 let mainWindow = null;
 let tray = null;
 // 从远程页面读取到的歌单名称列表（用户创建的自定义歌单）
@@ -950,8 +1102,22 @@ function createWindow() {
   });
 
   // 诊断：页面加载失败时打印错误，便于定位白屏 / 跳转失败
-  mainWindow.webContents.on('did-fail-load', (_e, errorCode, errorDescription, validatedURL) => {
-    console.log('[did-fail-load] code:', errorCode, 'desc:', errorDescription, 'url:', validatedURL);
+  // 主页面加载失败（非静态资源）时作为兜底，跳回设置页并提示，避免卡死在错误页
+  mainWindow.webContents.on('did-fail-load', (_e, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    console.log('[did-fail-load] code:', errorCode, 'desc:', errorDescription, 'url:', validatedURL, 'mainFrame:', isMainFrame);
+    // 非主框架（子资源）失败不处理，或未设置过远程地址（本地 setup 页）不处理
+    if (!isMainFrame || !lastServerUrl) return;
+    // 仅在失败的 URL 与最近 applyServerUrl 的 URL 高度匹配时才跳回（避免子页面导航失败被误处理）
+    let match = false;
+    try { match = validatedURL && new URL(validatedURL).origin === new URL(lastServerUrl).origin; } catch {}
+    if (!match) return;
+    // -3 ERR_ABORTED 通常是用户主动导航 / 新的 loadURL 覆盖，不视为错误
+    if (errorCode === -3) return;
+    const errMsg =
+      '页面加载失败（错误码 ' + errorCode + '），请确认飞牛音乐已安装且服务器可访问：' + (errorDescription || validatedURL);
+    console.log('[did-fail-load] bounce to setup:', errMsg);
+    pendingLoginError = errMsg;
+    loadSetup();
   });
 
   // 诊断：导航开始时打印，确认 loadURL 是否触发
@@ -969,13 +1135,22 @@ function createWindow() {
   // - 没有：进入设置页
   const cfg = readConfig();
   if (cfg.serverInput) {
-    resolveAccessUrl(cfg.serverInput).then(({ url, error }) => {
-      if (url) {
-        applyServerUrl(url);
-      } else {
+    resolveAccessUrl(cfg.serverInput).then(async ({ url, error }) => {
+      if (!url) {
         console.log('[startup] resolve failed:', error);
+        pendingLoginError = error || '服务器地址解析失败，请重新输入';
         loadSetup();
+        return;
       }
+      // 启动时同样验证是否为飞牛音乐，避免白屏 / 502 卡死
+      const verified = await verifyFnMusic(url);
+      if (!verified.ok) {
+        console.log('[startup] verify failed:', verified.error);
+        pendingLoginError = verified.error;
+        loadSetup();
+        return;
+      }
+      applyServerUrl(url);
     });
   } else {
     loadSetup();
@@ -998,6 +1173,8 @@ function createWindow() {
 
 // 当前允许的站点前缀（origin），仅在进入服务器后生效
 let allowedOrigin = null;
+// 最近一次 applyServerUrl 的目标 URL（用于 did-fail-load 判断是否为主页面加载失败）
+let lastServerUrl = null;
 function getAllowedOrigin() {
   return allowedOrigin;
 }
@@ -1054,6 +1231,7 @@ function applyServerUrl(rawUrl) {
   } catch {
     allowedOrigin = null;
   }
+  lastServerUrl = url;
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.loadURL(url, { userAgent: UA }, (err) => {
       if (err) console.log('[applyServerUrl] loadURL error:', err.code, err.message);
@@ -1064,6 +1242,7 @@ function applyServerUrl(rawUrl) {
 // 加载本地服务器地址输入页
 function loadSetup() {
   allowedOrigin = null;
+  lastServerUrl = null;
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.loadFile(path.join(__dirname, 'setup.html'));
   }
@@ -1113,6 +1292,14 @@ ipcMain.handle('submit-server', async (event, payload) => {
   if (!url) {
     return { ok: false, error };
   }
+
+  // 在 loadURL 之前先验证：避免直接加载 502 / 非飞牛音乐页面导致卡死
+  const verified = await verifyFnMusic(url);
+  if (!verified.ok) {
+    console.log('[submit-server] verify failed:', verified.error);
+    return { ok: false, error: verified.error };
+  }
+
   // 持久化用户原始输入与登录凭据，下次启动重新解析
   const cfg = readConfig();
   cfg.serverInput = input;
