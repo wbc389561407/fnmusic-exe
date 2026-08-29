@@ -476,6 +476,15 @@ function snapToZoomStep(value) {
   return best;
 }
 
+// 按当前窗口内容区宽度自适应页面缩放：以 1280 宽为 100%，吸附到浏览器固定缩放档位
+// 窗口拉大 → 页面等比放大，窗口拉小 → 等比缩小
+const ZOOM_BASE_WIDTH = 1280;
+function applyAdaptiveZoom() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const [contentW] = mainWindow.getContentSize();
+  mainWindow.webContents.setZoomFactor(snapToZoomStep(contentW / ZOOM_BASE_WIDTH));
+}
+
 // 切换窗口档位：持久化配置并立即应用尺寸与缩放
 function applyWindowPreset(preset) {
   if (!WIN_PRESETS[preset]) return;
@@ -483,9 +492,9 @@ function applyWindowPreset(preset) {
   cfg.windowPreset = preset;
   writeConfig(cfg);
   if (mainWindow && !mainWindow.isDestroyed()) {
-    const { winWidth, winHeight, zoom } = calcWinSizeAndZoom(preset);
+    const { winWidth, winHeight } = calcWinSizeAndZoom(preset);
     mainWindow.setSize(winWidth, winHeight);
-    mainWindow.webContents.setZoomFactor(zoom);
+    applyAdaptiveZoom();
   }
   // 刷新托盘菜单勾选状态
   if (tray) tray.setContextMenu(buildTrayMenu());
@@ -842,20 +851,107 @@ function tryAutoPlay() {
 function createWindow() {
   const preset = getSavedPreset();
   const { winWidth, winHeight, zoom } = calcWinSizeAndZoom(preset);
-  mainWindow = new BrowserWindow({
-    width: winWidth,
+
+  // 任务栏缩略图工具栏按钮（悬停任务栏图标时出现）：上一首 / 播放暂停 / 下一首
+  // 手工编码 16x16 BGRA 位图（nativeImage 不支持 SVG dataURL），图形 10px 高、居中
+  const TB_SHAPES = {
+    // |◀ 上一首
+    prev: ['................','................','................','...xx.......x...','...xx......xx...','...xx.....xxx...','...xx....xxxx...','...xx...xxxxx...','...xx...xxxxx...','...xx....xxxx...','...xx.....xxx...','...xx......xx...','...xx.......x...','................','................','................'],
+    // ▶| 下一首
+    next: ['................','................','................','...x.......xx...','...xx......xx...','...xxx.....xx...','...xxxx....xx...','...xxxxx...xx...','...xxxxx...xx...','...xxxx....xx...','...xxx.....xx...','...xx......xx...','...x.......xx...','................','................','................'],
+    // ▶ 播放
+    play: ['................','................','................','.....x..........','.....xx.........','.....xxx........','.....xxxx.......','.....xxxxx......','.....xxxxx......','.....xxxx.......','.....xxx........','.....xx.........','.....x..........','................','................','................'],
+    // ⏸ 暂停
+    pause: ['................','................','................','.....xx..xx.....','.....xx..xx.....','.....xx..xx.....','.....xx..xx.....','.....xx..xx.....','.....xx..xx.....','.....xx..xx.....','.....xx..xx.....','.....xx..xx.....','.....xx..xx.....','................','................','................'],
+  };
+  function makeTbIcon(kind) {
+    const rows = TB_SHAPES[kind];
+    const w = 16, h = rows.length;
+    const buf = Buffer.alloc(w * h * 4, 0); // 全透明底
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < rows[y].length; x++) {
+        if (rows[y][x] === 'x') {
+          const i = (y * w + x) * 4;
+          buf[i] = buf[i + 1] = buf[i + 2] = buf[i + 3] = 255; // 不透明白
+        }
+      }
+    }
+    return nativeImage.createFromBitmap(buf, { width: w, height: h });
+  }
+  const tbIconCache = {};
+  function getTbIcon(kind) {
+    if (!tbIconCache[kind]) tbIconCache[kind] = makeTbIcon(kind);
+    return tbIconCache[kind];
+  }
+  function updateThumbar(playing) {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.setThumbarButtons([
+      {
+        tooltip: '上一首',
+        icon: getTbIcon('prev'),
+        click: () => clickPlayerBtn(['上一首', '上一步', '上一曲', 'prev', 'previous'])
+      },
+      {
+        tooltip: playing ? '暂停' : '播放',
+        icon: getTbIcon(playing ? 'pause' : 'play'),
+        click: () => clickPlayerBtn(playing ? ['暂停', 'pause'] : ['播放', 'play'])
+      },
+      {
+        tooltip: '下一首',
+        icon: getTbIcon('next'),
+        click: () => clickPlayerBtn(['下一首', '下一步', '下一曲', 'next'])
+      }
+    ]);
+  }
+  // 在页面里点击匹配 aria-label / title / class 的播放器按钮
+  function clickPlayerBtn(labels) {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    const arr = JSON.stringify(labels);
+    mainWindow.webContents.executeJavaScript(`
+      (function(){
+        var labels = ${arr};
+        // 先按 aria-label / title 精确匹配
+        for (var i = 0; i < labels.length; i++) {
+          var b = document.querySelector('button[aria-label="' + labels[i] + '"], [role="button"][aria-label="' + labels[i] + '"]');
+          if (b) { b.click(); return true; }
+        }
+        // 退而求其次：audio 元素直接控制（播放/暂停兜底）
+        var a = document.querySelector('audio');
+        if (a && labels.indexOf('暂停') !== -1 && !a.paused) { a.pause(); return true; }
+        if (a && labels.indexOf('播放') !== -1 && a.paused) { a.play(); return true; }
+        return false;
+      })();
+    `).catch(() => {});
+  }
+  // 轮询页面播放状态，同步任务栏缩略图按钮（播放/暂停图标切换）
+  let lastPlaying = null;
+  function pollPlayingState() {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.executeJavaScript(`
+      (function(){
+        if (document.querySelector('button[aria-label="暂停"]')) return true;
+        var a = document.querySelector('audio');
+        return a ? !a.paused : false;
+      })();
+    `).then(playing => {
+      if (playing !== lastPlaying) {
+        lastPlaying = playing;
+        updateThumbar(playing);
+      }
+    }).catch(() => {});
+  }
+  updateThumbar(false);
+  setInterval(pollPlayingState, 1500);
+  mainWindow = new BrowserWindow({  width: winWidth,
     height: winHeight,
-    minWidth: 1000,
-    minHeight: 860,
+    minWidth: 900,
+    minHeight: 600,
     title: '飞牛音乐',
     backgroundColor: '#00000000',
     show: false,
     autoHideMenuBar: true,
     // 无边框客户端外观：隐藏标题栏，叉叉用自定义注入按钮（原生 overlay 无法控制 hover 底色）
     frame: false,
-    // 仅保留关闭按钮（叉叉 = 最小化到托盘），隐藏最小化 / 最大化按钮
-    minimizable: false,
-    maximizable: false,
     titleBarStyle: 'hidden',
     icon: path.join(__dirname, 'build', 'icon.ico'),
     webPreferences: {
@@ -872,46 +968,57 @@ function createWindow() {
   });
 
   // 每次启动强制使用计算出的窗口尺寸与页面缩放，避免系统记住上次调整后的大小
+  // 窗口隐藏到托盘再恢复后 Windows 会清掉缩略图工具栏：重新显示时强制重设
+  // （lastPlaying 不变时轮询不会触发重设）
+  mainWindow.on('show', () => {
+    lastPlaying = null;
+    pollPlayingState();
+  });
+  mainWindow.on('restore', () => {
+    lastPlaying = null;
+    pollPlayingState();
+  });
+
   mainWindow.once('ready-to-show', () => {
     mainWindow.setSize(winWidth, winHeight);
-    mainWindow.webContents.setZoomFactor(zoom);
+    applyAdaptiveZoom();
     mainWindow.show();
   });
 
-  // 窗口尺寸变化时保持页面缩放 100%，不再按高度动态调整
+  // 窗口尺寸变化时按宽度自适应页面缩放（防抖，避免拖动过程频繁触发）
   let resizeTimer = null;
   mainWindow.on('resize', () => {
     if (resizeTimer) clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(() => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.setZoomFactor(1.0);
-      }
-    }, 150);
+    resizeTimer = setTimeout(applyAdaptiveZoom, 150);
   });
 
   // 远程页面加载完成后，注入顶部可拖拽条（浮于页面之上，不占用布局空间，避免底部被裁）
   mainWindow.webContents.on('did-finish-load', () => {
     const currentUrl = mainWindow.webContents.getURL();
     if (!/^https?:/i.test(currentUrl)) return; // 仅对远程服务器页面注入
+    // 置顶状态持久：SPA 不整页刷新时注入脚本不重复执行（有 id 守卫），先同步状态
+    mainWindow.webContents.send('pin-changed', mainWindow.isAlwaysOnTop());
     mainWindow.webContents.insertCSS(`
       body { -webkit-app-region: no-drag; }
+      /* 页面整体下移 15px 给顶部标题条让位，同时收缩高度避免底部（播放栏）被截断 */
+      html, body { margin-top: 14px !important; height: calc(100% - 14px) !important; min-height: calc(100vh - 14px) !important; }
+      body > * { max-height: calc(100vh - 14px) !important; }
       .__fn-dragbar {
         position: fixed !important;
         top: 0 !important;
         left: 0 !important;
         right: 0 !important;
-        height: 36px !important;
+        height: 40px !important;
         -webkit-app-region: drag !important;
         z-index: 2147483647 !important;
-        background: rgba(15, 15, 23, 0.0) !important;
+        background: #1f1f2e !important;
         pointer-events: auto !important;
       }
-      .__fn-close-btn {
+      .__fn-close-btn, .__fn-min-btn, .__fn-max-btn, .__fn-pin-btn {
         position: fixed !important;
-        top: 8px !important;
-        right: 10px !important;
-        width: 22px !important;
-        height: 22px !important;
+        top: 0 !important;
+        width: 28px !important;
+        height: 40px !important;
         display: flex !important;
         align-items: center !important;
         justify-content: center !important;
@@ -921,18 +1028,23 @@ function createWindow() {
         color: #8a8a96 !important;
         background: transparent !important;
         border: none !important;
-        border-radius: 4px !important;
+        border-radius: 6px !important;
         transition: color 0.15s !important;
-        opacity: 0.7 !important;
+        opacity: 0.75 !important;
       }
-      .__fn-close-btn:hover {
+      .__fn-close-btn { right: 8px !important; }
+      .__fn-min-btn { right: 72px !important; }
+      .__fn-max-btn { right: 40px !important; }
+      .__fn-pin-btn { right: 104px !important; }
+      .__fn-close-btn:hover, .__fn-min-btn:hover, .__fn-max-btn:hover, .__fn-pin-btn:hover {
         color: #e8e8f0 !important;
-        background: transparent !important;
+        background: rgba(255, 255, 255, 0.08) !important;
         opacity: 1 !important;
       }
-      .__fn-close-btn svg {
-        width: 11px !important;
-        height: 11px !important;
+      .__fn-pin-btn.__fn-pinned { color: #6ab0ff !important; opacity: 1 !important; }
+      .__fn-close-btn svg, .__fn-min-btn svg, .__fn-max-btn svg, .__fn-pin-btn svg {
+        width: 13px !important;
+        height: 13px !important;
         display: block !important;
       }
       /* 隐藏首页「最近添加」歌曲模块 */
@@ -957,6 +1069,94 @@ function createWindow() {
           }
         });
         document.documentElement.appendChild(b);
+        // 置顶按钮（右上角，关闭按钮左侧）
+        var pin = document.createElement('div');
+        pin.id = '__fn-pin-btn';
+        pin.className = '__fn-pin-btn';
+        pin.title = '置顶';
+        pin.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l6 6-4 1v5l-2 2-2-2v-5l-4-1z"/></svg>';
+        pin.addEventListener('click', function(){
+          if (window.serverBridge && window.serverBridge.togglePin) window.serverBridge.togglePin();
+        });
+        document.documentElement.appendChild(pin);
+        if (window.serverBridge && window.serverBridge.onPinChanged) {
+          window.serverBridge.onPinChanged(function(pinned){
+            pin.classList.toggle('__fn-pinned', !!pinned);
+          });
+        }
+        // 最大化/还原按钮
+        var mx = document.createElement('div');
+        mx.id = '__fn-max-btn';
+        mx.className = '__fn-max-btn';
+        mx.title = '最大化';
+        var svgMax = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>';
+        var svgRestore = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="3" y="8" width="13" height="13" rx="2"/><path d="M8 8V5a2 2 0 0 1 2-2h11v11a2 2 0 0 1-2 2h-3"/></svg>';
+        mx.innerHTML = svgMax;
+        mx.addEventListener('click', function(){
+          if (window.serverBridge && window.serverBridge.toggleMaximize) window.serverBridge.toggleMaximize();
+        });
+        document.documentElement.appendChild(mx);
+        if (window.serverBridge && window.serverBridge.onMaximizedChanged) {
+          window.serverBridge.onMaximizedChanged(function(m){
+            mx.innerHTML = m ? svgRestore : svgMax;
+            mx.title = m ? '还原' : '最大化';
+          });
+        }
+        // 最小化按钮
+        var mn = document.createElement('div');
+        mn.id = '__fn-min-btn';
+        mn.className = '__fn-min-btn';
+        mn.title = '最小化';
+        mn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>';
+        mn.addEventListener('click', function(){
+          if (window.serverBridge && window.serverBridge.minimizeWindow) window.serverBridge.minimizeWindow();
+        });
+        document.documentElement.appendChild(mn);
+        // 顶部标题条占用 14px，收缩占满视口的容器高度；
+        // 歌曲列表最后几首会被底部悬浮播放栏遮住：找 data-index 最大的行注入 padding-bottom 100px
+        var OFFSET = 14;
+        function fixLayout(){
+          var vh = window.innerHeight;
+          // 1. 收缩占满视口的非滚动容器，让底部不被标题条顶出的 14px 截断
+          (function walk(el){
+            for (var i = 0; i < el.children.length; i++) {
+              var c = el.children[i];
+              if (c.id && c.id.indexOf('__fn-') === 0) continue;
+              var h = c.getBoundingClientRect().height;
+              if (h < vh * 0.5) continue;
+              if (h >= vh - 1) {
+                if (!c.__fnShrunk) {
+                  c.__fnShrunk = true;
+                  c.style.setProperty('height', 'calc(100vh - ' + OFFSET + 'px)', 'important');
+                  c.style.setProperty('max-height', 'calc(100vh - ' + OFFSET + 'px)', 'important');
+                }
+                walk(c);
+              } else {
+                walk(c);
+              }
+            }
+          })(document.body);
+          // 2. 给最后一首歌（data-index 最大）注入 padding-bottom，滑过播放栏
+          var rows = document.querySelectorAll('[data-index]');
+          var last = null, maxIdx = -1;
+          for (var i = 0; i < rows.length; i++) {
+            var idx = parseInt(rows[i].getAttribute('data-index'), 10);
+            if (!isNaN(idx) && idx > maxIdx) { maxIdx = idx; last = rows[i]; }
+          }
+          if (last && !last.__fnPadded) {
+            last.__fnPadded = true;
+            last.style.setProperty('padding-bottom', '100px', 'important');
+          }
+        }
+        fixLayout();
+        if (!window.__fnShrinkObs) {
+          window.__fnShrinkObs = true;
+          var t = null;
+          new MutationObserver(function(){
+            if (t) clearTimeout(t);
+            t = setTimeout(fixLayout, 300);
+          }).observe(document.body, { childList: true, subtree: true });
+        }
       })();
     `).catch(() => {});
     // 隐藏首页「最近添加」歌曲模块（保留「最近添加」专辑模块）
@@ -1157,6 +1357,14 @@ function createWindow() {
   }
 
   // 叉叉 = 最小化到托盘；只有 isQuitting（托盘右键退出）才真正关闭
+  // 最大化状态变化时通知渲染层切换按钮图标
+  mainWindow.on('maximize', () => {
+    if (!mainWindow.isDestroyed()) mainWindow.webContents.send('maximized-changed', true);
+  });
+  mainWindow.on('unmaximize', () => {
+    if (!mainWindow.isDestroyed()) mainWindow.webContents.send('maximized-changed', false);
+  });
+
   mainWindow.on('close', (event) => {
     if (!isQuitting) {
       event.preventDefault();
@@ -1367,6 +1575,28 @@ ipcMain.handle('minimize-to-tray', () => {
     mainWindow.hide();
   }
   return true;
+});
+
+// 窗口最小化（任务栏）
+ipcMain.handle('window-minimize', () => {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.minimize();
+  return true;
+});
+
+// 最大化 / 还原切换
+ipcMain.handle('toggle-maximize', () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  if (mainWindow.isMaximized()) mainWindow.unmaximize();
+  else mainWindow.maximize();
+  return mainWindow.isMaximized();
+});
+
+// 置顶切换
+ipcMain.handle('toggle-pin', () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  const pinned = !mainWindow.isAlwaysOnTop();
+  mainWindow.setAlwaysOnTop(pinned);
+  return pinned;
 });
 
 // 渲染层通过 MutationObserver 持续上报侧边栏歌单列表，主进程缓存并刷新托盘菜单

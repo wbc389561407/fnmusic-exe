@@ -11,6 +11,16 @@ contextBridge.exposeInMainWorld('serverBridge', {
   checkUpdate: () => ipcRenderer.invoke('check-update'),
   // 最小化到托盘（叉叉按钮调用）
   minimizeToTray: () => ipcRenderer.invoke('minimize-to-tray'),
+  // 窗口最小化（任务栏）
+  minimizeWindow: () => ipcRenderer.invoke('window-minimize'),
+  // 最大化 / 还原切换
+  toggleMaximize: () => ipcRenderer.invoke('toggle-maximize'),
+  // 置顶切换
+  togglePin: () => ipcRenderer.invoke('toggle-pin'),
+  // 监听最大化状态变化（切换图标）
+  onMaximizedChanged: (cb) => ipcRenderer.on('maximized-changed', (_e, m) => cb(m)),
+  // 监听置顶状态变化（页面加载后同步状态）
+  onPinChanged: (cb) => ipcRenderer.on('pin-changed', (_e, p) => cb(p)),
   // 读取已保存的服务器地址与用户名（用于设置页预填）
   getSavedInput: () => ipcRenderer.invoke('get-saved-input'),
   // 登录接口返回错误时，渲染层通知主进程跳回设置页
