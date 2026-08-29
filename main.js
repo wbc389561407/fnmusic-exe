@@ -1000,9 +1000,6 @@ function createWindow() {
     mainWindow.webContents.send('pin-changed', mainWindow.isAlwaysOnTop());
     mainWindow.webContents.insertCSS(`
       body { -webkit-app-region: no-drag; }
-      /* 页面整体下移 15px 给顶部标题条让位，同时收缩高度避免底部（播放栏）被截断 */
-      html, body { margin-top: 14px !important; height: calc(100% - 14px) !important; min-height: calc(100vh - 14px) !important; }
-      body > * { max-height: calc(100vh - 14px) !important; }
       .__fn-dragbar {
         position: fixed !important;
         top: 0 !important;
@@ -1011,7 +1008,7 @@ function createWindow() {
         height: 40px !important;
         -webkit-app-region: drag !important;
         z-index: 2147483647 !important;
-        background: #1f1f2e !important;
+        background: transparent !important;
         pointer-events: auto !important;
       }
       .__fn-close-btn, .__fn-min-btn, .__fn-max-btn, .__fn-pin-btn {
@@ -1112,31 +1109,9 @@ function createWindow() {
           if (window.serverBridge && window.serverBridge.minimizeWindow) window.serverBridge.minimizeWindow();
         });
         document.documentElement.appendChild(mn);
-        // 顶部标题条占用 14px，收缩占满视口的容器高度；
         // 歌曲列表最后几首会被底部悬浮播放栏遮住：找 data-index 最大的行注入 padding-bottom 100px
-        var OFFSET = 14;
         function fixLayout(){
-          var vh = window.innerHeight;
-          // 1. 收缩占满视口的非滚动容器，让底部不被标题条顶出的 14px 截断
-          (function walk(el){
-            for (var i = 0; i < el.children.length; i++) {
-              var c = el.children[i];
-              if (c.id && c.id.indexOf('__fn-') === 0) continue;
-              var h = c.getBoundingClientRect().height;
-              if (h < vh * 0.5) continue;
-              if (h >= vh - 1) {
-                if (!c.__fnShrunk) {
-                  c.__fnShrunk = true;
-                  c.style.setProperty('height', 'calc(100vh - ' + OFFSET + 'px)', 'important');
-                  c.style.setProperty('max-height', 'calc(100vh - ' + OFFSET + 'px)', 'important');
-                }
-                walk(c);
-              } else {
-                walk(c);
-              }
-            }
-          })(document.body);
-          // 2. 给最后一首歌（data-index 最大）注入 padding-bottom，滑过播放栏
+          // 给最后一首歌（data-index 最大）注入 padding-bottom，滑过播放栏
           var rows = document.querySelectorAll('[data-index]');
           var last = null, maxIdx = -1;
           for (var i = 0; i < rows.length; i++) {
