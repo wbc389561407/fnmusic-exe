@@ -1207,6 +1207,41 @@ function createWindow() {
       })();
     `).catch(() => {});
 
+    // 底部播放栏贴底：测量播放栏底边与窗口底部的实际空隙，用 translateY 精确下移补齐
+    // 关键：getBoundingClientRect() 含 transform，必须先减去上次注入的位移得到「原始底边」，
+    // 否则目标值被自己的位移污染，窗口变化时会反复重算 → 与页面过渡动画互相撕扯（来回蹦跶）
+    // FINE_TUNE_PX：手动微调，正数 = 在自动贴底基础上再往下压，负数 = 往上收
+    mainWindow.webContents.executeJavaScript(`
+      (function(){
+        if (window.__fnPlayerBottomStarted) return;
+        window.__fnPlayerBottomStarted = true;
+        var FINE_TUNE_PX = 0;
+        function stickBottom(){
+          var p = document.querySelector('div.music-player-glass[data-music-queue-interaction="true"]');
+          if (!p || !p.isConnected) return;
+          var applied = p.__fnAppliedY || 0;
+          var rawBottom = p.getBoundingClientRect().bottom - applied;
+          var gap = window.innerHeight - rawBottom + FINE_TUNE_PX;
+          gap = Math.round(gap * 10) / 10;
+          // 目标没变不重写 style，避免反复触发页面布局过渡动画
+          if (Math.abs(gap - applied) < 0.5) return;
+          p.__fnAppliedY = gap;
+          p.style.setProperty('transform', 'translateY(' + gap + 'px)', 'important');
+        }
+        stickBottom();
+        setTimeout(stickBottom, 300);
+        setTimeout(stickBottom, 1000);
+        // 窗口缩放（含 zoom 自适应）后防抖校准：等页面重排/动画稳定再测，避开中间态
+        var rt = null;
+        window.addEventListener('resize', function(){
+          if (rt) clearTimeout(rt);
+          rt = setTimeout(stickBottom, 200);
+        });
+        // 兜底周期校准（幂等：目标不变时不会重写）
+        setInterval(stickBottom, 1000);
+      })();
+    `).catch(() => {});
+
     // 隐藏页面内「退出登录」按钮（避免误触退出，登录态由本应用托管）
     // 该按钮用 Tailwind 通用类无唯一标识，按文本内容匹配；SPA 异步渲染，用 MutationObserver 持续隐藏
     mainWindow.webContents.executeJavaScript(`
