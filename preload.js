@@ -17,6 +17,8 @@ contextBridge.exposeInMainWorld('serverBridge', {
   toggleMaximize: () => ipcRenderer.invoke('toggle-maximize'),
   // 置顶切换
   togglePin: () => ipcRenderer.invoke('toggle-pin'),
+  // 转点击页面内按钮（标题栏「设置/用户」按钮触发原页面功能）
+  clickPageButton: (labels) => ipcRenderer.invoke('page-click', labels),
   // 监听最大化状态变化（切换图标）
   onMaximizedChanged: (cb) => ipcRenderer.on('maximized-changed', (_e, m) => cb(m)),
   // 监听置顶状态变化（页面加载后同步状态）

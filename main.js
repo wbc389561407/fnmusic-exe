@@ -992,14 +992,17 @@ function createWindow() {
     resizeTimer = setTimeout(applyAdaptiveZoom, 150);
   });
 
-  // 远程页面加载完成后，注入顶部可拖拽条（浮于页面之上，不占用布局空间，避免底部被裁）
-  mainWindow.webContents.on('did-finish-load', () => {
+  // 远程页面 DOM 就绪即注入（早于 did-finish-load 与 React 渲染，避免先显示再隐藏的闪烁）
+  mainWindow.webContents.on('dom-ready', () => {
     const currentUrl = mainWindow.webContents.getURL();
     if (!/^https?:/i.test(currentUrl)) return; // 仅对远程服务器页面注入
     // 置顶状态持久：SPA 不整页刷新时注入脚本不重复执行（有 id 守卫），先同步状态
     mainWindow.webContents.send('pin-changed', mainWindow.isAlwaysOnTop());
     mainWindow.webContents.insertCSS(`
       body { -webkit-app-region: no-drag; }
+      /* 隐藏页面自带的「设置/用户」悬浮胶囊（功能已移入标题栏）：
+         纯 CSS :has() 渲染首帧即生效，无需等 JS/Observer，避免先显示后隐藏的闪烁 */
+      div:has(> div > button[aria-label="设置"]):has(> * > button[aria-label="打开用户菜单"]) { visibility: hidden !important; }
       .__fn-dragbar {
         position: fixed !important;
         top: 0 !important;
@@ -1011,7 +1014,7 @@ function createWindow() {
         background: transparent !important;
         pointer-events: auto !important;
       }
-      .__fn-close-btn, .__fn-min-btn, .__fn-max-btn, .__fn-pin-btn {
+      .__fn-close-btn, .__fn-min-btn, .__fn-max-btn, .__fn-pin-btn, .__fn-set-btn, .__fn-user-btn {
         position: fixed !important;
         top: 0 !important;
         width: 28px !important;
@@ -1033,13 +1036,15 @@ function createWindow() {
       .__fn-min-btn { right: 72px !important; }
       .__fn-max-btn { right: 40px !important; }
       .__fn-pin-btn { right: 104px !important; }
-      .__fn-close-btn:hover, .__fn-min-btn:hover, .__fn-max-btn:hover, .__fn-pin-btn:hover {
+      .__fn-set-btn { right: 168px !important; }
+      .__fn-user-btn { right: 136px !important; }
+      .__fn-close-btn:hover, .__fn-min-btn:hover, .__fn-max-btn:hover, .__fn-pin-btn:hover, .__fn-set-btn:hover, .__fn-user-btn:hover {
         color: #e8e8f0 !important;
         background: rgba(255, 255, 255, 0.08) !important;
         opacity: 1 !important;
       }
       .__fn-pin-btn.__fn-pinned { color: #6ab0ff !important; opacity: 1 !important; }
-      .__fn-close-btn svg, .__fn-min-btn svg, .__fn-max-btn svg, .__fn-pin-btn svg {
+      .__fn-close-btn svg, .__fn-min-btn svg, .__fn-max-btn svg, .__fn-pin-btn svg, .__fn-set-btn svg, .__fn-user-btn svg {
         width: 13px !important;
         height: 13px !important;
         display: block !important;
@@ -1109,6 +1114,48 @@ function createWindow() {
           if (window.serverBridge && window.serverBridge.minimizeWindow) window.serverBridge.minimizeWindow();
         });
         document.documentElement.appendChild(mn);
+        // 设置按钮（转点击页面原「设置」按钮，原悬浮胶囊已隐藏）
+        var st = document.createElement('div');
+        st.id = '__fn-set-btn';
+        st.className = '__fn-set-btn';
+        st.title = '设置';
+        st.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor"><path fill-rule="evenodd" clip-rule="evenodd" d="M11.998 8.5a3.5 3.5 0 110 7 3.5 3.5 0 010-7zm0 2a1.5 1.5 0 10.001 3 1.5 1.5 0 000-3z"/><path fill-rule="evenodd" clip-rule="evenodd" d="M15.64 2.216c1.3 0 2.503.688 3.162 1.807L22.4 10.14a3.668 3.668 0 010 3.718l-3.598 6.117a3.668 3.668 0 01-3.161 1.807H8.359c-1.3 0-2.503-.688-3.161-1.807L1.6 13.858a3.668 3.668 0 010-3.718l3.598-6.117a3.669 3.669 0 013.16-1.807h7.283zm-7.281 2c-.59 0-1.137.312-1.437.821l-3.598 6.117a1.667 1.667 0 000 1.69l3.598 6.117c.3.509.846.821 1.437.821h7.282c.59 0 1.137-.312 1.436-.821l3.6-6.117a1.667 1.667 0 000-1.69l-3.6-6.117a1.667 1.667 0 00-1.436-.821H8.359z"/></svg>';
+        st.addEventListener('click', function(){
+          if (window.serverBridge && window.serverBridge.clickPageButton) window.serverBridge.clickPageButton(['设置']);
+        });
+        document.documentElement.appendChild(st);
+        // 用户菜单按钮（转点击页面原头像按钮）
+        var ub = document.createElement('div');
+        ub.id = '__fn-user-btn';
+        ub.className = '__fn-user-btn';
+        ub.title = '用户菜单';
+        ub.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5"/></svg>';
+        ub.addEventListener('click', function(){
+          if (window.serverBridge && window.serverBridge.clickPageButton) window.serverBridge.clickPageButton(['打开用户菜单']);
+        });
+        document.documentElement.appendChild(ub);
+        // 隐藏页面自带的「设置/用户」悬浮胶囊（功能已移入标题栏）
+        // 用 visibility:hidden 保留坐标，点击标题栏按钮触发原按钮时弹出菜单位置不变
+        function hideDock(){
+          var s = document.querySelector('button[aria-label="设置"]');
+          var u = document.querySelector('button[aria-label="打开用户菜单"]');
+          if (!s || !u) return;
+          var p = s.parentElement;
+          while (p && !p.contains(u)) p = p.parentElement;
+          if (p && p !== document.body && !p.__fnDockHidden) {
+            p.__fnDockHidden = true;
+            p.style.setProperty('visibility', 'hidden', 'important');
+          }
+        }
+        hideDock();
+        if (!window.__fnHideDockObs) {
+          window.__fnHideDockObs = true;
+          var ht = null;
+          new MutationObserver(function(){
+            if (ht) clearTimeout(ht);
+            ht = setTimeout(hideDock, 300);
+          }).observe(document.body, { childList: true, subtree: true });
+        }
         // 歌曲列表最后几首会被底部悬浮播放栏遮住：找 data-index 最大的行注入 padding-bottom 100px
         function fixLayout(){
           // 给最后一首歌（data-index 最大）注入 padding-bottom，滑过播放栏
@@ -1572,6 +1619,22 @@ ipcMain.handle('toggle-pin', () => {
   const pinned = !mainWindow.isAlwaysOnTop();
   mainWindow.setAlwaysOnTop(pinned);
   return pinned;
+});
+
+// 标题栏「设置/用户」按钮：转点击页面内对应按钮（原悬浮胶囊已隐藏）
+ipcMain.handle('page-click', (_event, labels) => {
+  if (!mainWindow || mainWindow.isDestroyed() || !Array.isArray(labels)) return false;
+  const arr = JSON.stringify(labels);
+  return mainWindow.webContents.executeJavaScript(`
+    (function(){
+      var labels = ${arr};
+      for (var i = 0; i < labels.length; i++) {
+        var b = document.querySelector('button[aria-label="' + labels[i] + '"], button[title="' + labels[i] + '"], [role="button"][aria-label="' + labels[i] + '"]');
+        if (b) { b.click(); return true; }
+      }
+      return false;
+    })();
+  `).catch(() => false);
 });
 
 // 渲染层通过 MutationObserver 持续上报侧边栏歌单列表，主进程缓存并刷新托盘菜单
