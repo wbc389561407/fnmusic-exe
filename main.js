@@ -179,36 +179,35 @@ async function resolveFnid(fnid) {
   }
 }
 
-// 顺序探测候选地址：先逐个尝试局域网 http，通则用；全不通则用 https 中继兜底
-// 注意：https 中继不做主动探测（证书可能过期，fetch 会失败），直接交由 BrowserWindow 加载
+// 顺序验证候选地址：逐个补 /music/ 后用 verifyFnMusic 完整验证（跟随重定向 + 页面识别）
+// - 覆盖局域网 http 与 https 中继：verifyFnMusic 对 fnos.net / 局域网 IP 放行自签证书，可安全探测 https
+// - 「可达但不是音乐服务」的候选（如 5666 端口跑着别的服务）会被拒绝并继续尝试下一个
+// - fnos.net 中继候选：入口为 SPA 壳无法识别时 2xx 即放行，沿用原始中继地址（见 verifyFnMusic）
+// - 第一个验证通过的候选生效，返回其重定向后的最终地址（重定向到新地址则用新地址访问）
+// 返回 { url, verified }（成功）或 { url: null, error }（全部失败）
 async function probeCandidates(candidates) {
-  const withTimeout = (p, ms) =>
-    Promise.race([
-      p,
-      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))
-    ]);
-
-  const httpCandidates = candidates.filter((u) => u.startsWith('http://'));
-  const httpsFallback = candidates.find((u) => u.startsWith('https://'));
-
-  // 顺序逐个探测局域网 http 候选，第一个可达即返回
-  for (const url of httpCandidates) {
-    try {
-      // 任何 HTTP 响应（含 401/404/302）都说明地址可达
-      await withTimeout(fetch(url, { method: 'GET', redirect: 'manual' }), 5000);
-      console.log('[probeCandidates] lan reachable:', url);
-      return url;
-    } catch (e) {
-      console.log('[probeCandidates] lan failed:', url, e.message);
+  let lastError = null;
+  for (const cand of candidates) {
+    const url = ensureMusicSuffix(cand);
+    if (!url) {
+      lastError = '地址格式无效';
+      continue;
     }
+    console.log('[probeCandidates] try ->', url);
+    const verified = await verifyFnMusic(url);
+    if (verified.ok) {
+      const finalUrl = verified.finalUrl || url;
+      console.log('[probeCandidates] verified:', url, '->', finalUrl);
+      return { url: finalUrl, verified };
+    }
+    lastError = verified.error;
+    console.log('[probeCandidates] failed:', url, '-', verified.error);
   }
-
-  console.log('[probeCandidates] all lan failed, fallback to relay');
-  return httpsFallback || null;
+  return { url: null, error: lastError || '所有候选地址均不可达，请检查网络或使用网址登录' };
 }
 
 // 统一解析用户输入为可访问地址（异步：fnid 分支需要调用远程 API）
-// - fnid：调 fnos.net API 获取候选 → 顺序探测局域网 → 不通再用中继
+// - fnid：调 fnos.net API 获取候选 → 逐候选完整验证（局域网 http 优先，https 中继兜底），用重定向后最终地址
 // - 不带协议且不带端口的域名 / IP：先试 http 默认端口，不通再补 5666 端口（飞牛 NAS 默认端口）
 // - 带协议 / 带端口：完全尊重用户输入，单地址验证
 // - 验证时跟随重定向，重定向到新地址则用新地址访问
@@ -223,16 +222,12 @@ async function resolveAccessUrl(input) {
     if (!candidates || candidates.length === 0) {
       return { url: null, error: 'fnid 解析失败，请检查或使用网址登录' };
     }
-    const selected = await probeCandidates(candidates);
-    if (!selected) {
-      return { url: null, error: '所有候选地址均不可达，请检查网络或使用网址登录' };
+    const { url, verified, error } = await probeCandidates(candidates);
+    if (!url) {
+      return { url: null, error: error || '所有候选地址均不可达，请检查网络或使用网址登录' };
     }
-    const finalUrl = ensureMusicSuffix(selected);
-    if (!finalUrl) {
-      return { url: null, error: '解析到的地址格式无效' };
-    }
-    console.log('[resolveAccessUrl] fnid ->', finalUrl);
-    return { url: finalUrl, error: null };
+    console.log('[resolveAccessUrl] fnid ->', url);
+    return { url, error: null, verified };
   }
 
   const base = normalizeUrl(s);
@@ -302,16 +297,28 @@ function classifyPage(bodyText) {
   return 'other';
 }
 
+// 判断主机是否为 fnos.net 中继域（子域名形式 xxx.fnos.net 或路径形式 fnos.net/xxx）
+function isFnosRelayHost(host) {
+  return host === 'fnos.net' || (typeof host === 'string' && host.endsWith('.fnos.net'));
+}
+
 // 在 loadURL 之前做一次 HTTP 请求探测，避免直接加载 502 / 非飞牛音乐页面导致卡死
 // 返回：
 // - 飞牛音乐页 → { ok: true, gate: false, finalUrl }（finalUrl 为重定向跟随后的最终地址）
 // - 访问码门禁页 → { ok: true, gate: true, finalUrl }（过码由 passGateInBackground 后台完成）
 // - 其他页面 → { ok: false, error }
+// fnos.net 中继特例：中继入口返回的是 FN Connect SPA 壳（需执行 JS 建立中继会话，HTTP 层拿不到
+// 飞牛音乐关键词）→ 拿到 2xx 响应即放行，且沿用原始中继地址（跳转与 JS 交给 BrowserWindow 处理）
 // 使用原生 http/https 模块而不是 fetch，确保能控制 SSL 证书验证（fnos.net/局域网 IP 允许自签）
 function verifyFnMusic(targetUrl) {
   return new Promise((resolve) => {
     const MAX_REDIRECTS = 10;
     const TIMEOUT_MS = 12000;
+    // 目标是否为 fnos.net 中继入口（决定未识别页面的放行策略）
+    let isRelayTarget = false;
+    try {
+      isRelayTarget = isFnosRelayHost(new URL(targetUrl).hostname);
+    } catch {}
 
     // 递归实现重定向跟随
     function doRequest(currentUrl, redirectLeft) {
@@ -325,7 +332,7 @@ function verifyFnMusic(targetUrl) {
 
       const isHttps = parsed.protocol === 'https:';
       const host = parsed.hostname;
-      const isHttpsRelay = host.endsWith('.fnos.net');
+      const isHttpsRelay = isFnosRelayHost(host);
       const isLanIp = /^\d+\.\d+\.\d+\.\d+$/.test(host);
       const mod = isHttps ? https : require('http');
 
@@ -416,6 +423,13 @@ function verifyFnMusic(targetUrl) {
           }
           if (kind === 'gate') {
             resolve({ ok: true, gate: true, finalUrl: currentUrl });
+            return;
+          }
+          // fnos.net 中继：入口页是 FN Connect SPA 壳（需 JS 建立中继会话），HTTP 层无法识别内容。
+          // 拿到 2xx 响应即视为中继可达 → 放行并沿用原始中继地址（跳转与 JS 交由 BrowserWindow 处理）
+          if (isRelayTarget && status >= 200 && status < 400) {
+            console.log('[verifyFnMusic] relay soft-pass:', targetUrl);
+            resolve({ ok: true, gate: false, finalUrl: targetUrl });
             return;
           }
           if (status >= 200 && status < 400) {
