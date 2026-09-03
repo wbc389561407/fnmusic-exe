@@ -85,7 +85,7 @@ npm run dist:portable
 
 ## 版本号
 
-当前版本：**v2.5.3**
+当前版本：**v3.0.0**
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)（Semantic Versioning）：
 
@@ -96,6 +96,10 @@ npm run dist:portable
 版本号同步维护在 [package.json](package.json) 的 `version` 字段。
 
 ## 更新日志
+
+### v3.0.0
+
+- 支持访问码
 
 ### v2.5.3
 
