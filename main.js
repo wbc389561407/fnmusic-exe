@@ -73,7 +73,7 @@ function writeConfig(cfg) {
 }
 
 // 规范化地址：
-// - 不带协议的纯 IP / 主机名 → 默认补 http:// 与 :5666 端口（飞牛 NAS 默认端口）
+// - 不带协议的纯 IP / 主机名 → 默认补 http://（端口探测在 resolveAccessUrl 中处理）
 // - 带协议 / 带端口 → 完全尊重用户输入，不覆盖
 // - 去首尾空格
 function normalizeUrl(input) {
@@ -82,12 +82,7 @@ function normalizeUrl(input) {
   const hasProto = /^https?:\/\//i.test(url);
   if (!hasProto) url = 'http://' + url;
   try {
-    const u = new URL(url);
-    // 仅「不带协议」场景补默认端口 5666；带协议的地址不干预端口
-    if (!hasProto && !u.port) {
-      u.port = '5666';
-    }
-    return u.href;
+    return new URL(url).href;
   } catch {
     return null;
   }
@@ -214,8 +209,10 @@ async function probeCandidates(candidates) {
 
 // 统一解析用户输入为可访问地址（异步：fnid 分支需要调用远程 API）
 // - fnid：调 fnos.net API 获取候选 → 顺序探测局域网 → 不通再用中继
-// - IP / 网址：规范化 + 补 /music/
-// 返回 { url, error }，url 非空即可直接访问
+// - 不带协议且不带端口的域名 / IP：先试 http 默认端口，不通再补 5666 端口（飞牛 NAS 默认端口）
+// - 带协议 / 带端口：完全尊重用户输入，单地址验证
+// - 验证时跟随重定向，重定向到新地址则用新地址访问
+// 返回 { url, error, verified }，url 非空即可直接访问；verified 为内部已完成的验证结果（外层可复用，避免重复请求）
 async function resolveAccessUrl(input) {
   const s = (input || '').trim();
   if (!s) return { url: null, error: '请输入服务器地址' };
@@ -238,12 +235,40 @@ async function resolveAccessUrl(input) {
     return { url: finalUrl, error: null };
   }
 
-  const url = normalizeUrl(s);
-  if (!url) return { url: null, error: '地址无效，请检查后重试' };
-  const finalUrl = ensureMusicSuffix(url);
-  if (!finalUrl) return { url: null, error: '地址格式无效' };
-  console.log('[resolveAccessUrl] address ->', finalUrl);
-  return { url: finalUrl, error: null };
+  const base = normalizeUrl(s);
+  if (!base) return { url: null, error: '地址无效，请检查后重试' };
+
+  // 构造候选地址列表（均补 /music/ 后缀）
+  const first = ensureMusicSuffix(base);
+  if (!first) return { url: null, error: '地址格式无效' };
+  const candidates = [first];
+
+  // 仅「不带协议且不带端口」的输入追加 5666 候选：先试默认端口，不通再补 5666
+  const hasProto = /^https?:\/\//i.test(s);
+  try {
+    const u = new URL(base);
+    if (!hasProto && !u.port) {
+      const u2 = new URL(base);
+      u2.port = '5666';
+      const second = ensureMusicSuffix(u2.href);
+      if (second && second !== first) candidates.push(second);
+    }
+  } catch {}
+
+  // 顺序验证候选：第一个通过即用；验证跟随重定向，用重定向后的新地址
+  let lastError = null;
+  for (const cand of candidates) {
+    console.log('[resolveAccessUrl] try ->', cand);
+    const verified = await verifyFnMusic(cand);
+    if (verified.ok) {
+      const finalUrl = verified.finalUrl || cand;
+      console.log('[resolveAccessUrl] address ->', finalUrl);
+      return { url: finalUrl, error: null, verified };
+    }
+    lastError = verified.error;
+    console.log('[resolveAccessUrl] failed:', cand, '-', verified.error);
+  }
+  return { url: null, error: lastError || '无法连接到服务器，请检查地址或网络' };
 }
 
 // 自动补 /music/ 后缀（带尾斜杠）
@@ -279,8 +304,8 @@ function classifyPage(bodyText) {
 
 // 在 loadURL 之前做一次 HTTP 请求探测，避免直接加载 502 / 非飞牛音乐页面导致卡死
 // 返回：
-// - 飞牛音乐页 → { ok: true, gate: false }
-// - 访问码门禁页 → { ok: true, gate: true }（过码由 passGateInBackground 后台完成）
+// - 飞牛音乐页 → { ok: true, gate: false, finalUrl }（finalUrl 为重定向跟随后的最终地址）
+// - 访问码门禁页 → { ok: true, gate: true, finalUrl }（过码由 passGateInBackground 后台完成）
 // - 其他页面 → { ok: false, error }
 // 使用原生 http/https 模块而不是 fetch，确保能控制 SSL 证书验证（fnos.net/局域网 IP 允许自签）
 function verifyFnMusic(targetUrl) {
@@ -367,7 +392,7 @@ function verifyFnMusic(targetUrl) {
             // 超限：认为页面存在，不再继续校验（SPA 首屏通常 < 500KB）
             res.destroy();
             // 超限且状态码正常 → 认为是合法服务
-            if (status >= 200 && status < 400) resolve({ ok: true, gate: false });
+            if (status >= 200 && status < 400) resolve({ ok: true, gate: false, finalUrl: currentUrl });
             else resolve({ ok: false, error: '服务器响应过大，无法校验' });
             return;
           }
@@ -383,13 +408,14 @@ function verifyFnMusic(targetUrl) {
           console.log('[verifyFnMusic] status:', status, 'url:', currentUrl, 'bodyLen:', bodyText.length);
 
           // 只放行飞牛音乐页与访问码门禁页（门禁页由 passGateInBackground 后台过码）
+          // finalUrl 为重定向跟随后的最终地址（重定向到新地址则用新地址访问）
           const kind = classifyPage(bodyText);
           if (kind === 'fnmusic') {
-            resolve({ ok: true, gate: false });
+            resolve({ ok: true, gate: false, finalUrl: currentUrl });
             return;
           }
           if (kind === 'gate') {
-            resolve({ ok: true, gate: true });
+            resolve({ ok: true, gate: true, finalUrl: currentUrl });
             return;
           }
           if (status >= 200 && status < 400) {
@@ -1653,24 +1679,26 @@ function createWindow() {
   // - 没有：进入设置页
   const cfg = readConfig();
   if (cfg.serverInput) {
-    resolveAccessUrl(cfg.serverInput).then(async ({ url, error }) => {
+    resolveAccessUrl(cfg.serverInput).then(async ({ url, error, verified }) => {
       if (!url) {
         console.log('[startup] resolve failed:', error);
         pendingLoginError = error || '服务器地址解析失败，请重新输入';
         loadSetup();
         return;
       }
-      // 启动时同样验证是否为飞牛音乐，避免白屏 / 502 卡死
-      const verified = await verifyFnMusic(url);
-      if (!verified.ok) {
-        console.log('[startup] verify failed:', verified.error);
-        pendingLoginError = verified.error;
+      // 启动时同样验证是否为飞牛音乐，避免白屏 / 502 卡死（resolve 内已验证则复用结果）
+      const v = verified || await verifyFnMusic(url);
+      if (!v.ok) {
+        console.log('[startup] verify failed:', v.error);
+        pendingLoginError = v.error;
         loadSetup();
         return;
       }
+      // 重定向到新地址则用新地址访问
+      const finalUrl = v.finalUrl || url;
       // 访问码门禁：隐藏窗口后台过码，主窗口不显示门禁页
-      if (verified.gate) {
-        const r = await passGateInBackground(url);
+      if (v.gate) {
+        const r = await passGateInBackground(finalUrl);
         if (r !== 'passed') {
           pendingLoginError = r === 'no-code'
             ? '服务器开启了访问码保护，请在访问密码栏填写后重试'
@@ -1679,7 +1707,7 @@ function createWindow() {
           return;
         }
       }
-      applyServerUrl(url);
+      applyServerUrl(finalUrl);
     });
   } else {
     loadSetup();
@@ -1834,20 +1862,22 @@ ipcMain.handle('submit-server', async (event, payload) => {
   const password = (payload && typeof payload === 'object' ? (payload.password || '') : '');
   const accessCode = (payload && typeof payload === 'object' ? (payload.accessCode || '').trim() : '');
 
-  const { url, error } = await resolveAccessUrl(input);
+  const { url, error, verified } = await resolveAccessUrl(input);
   if (!url) {
     return { ok: false, error };
   }
 
-  // 在 loadURL 之前先验证：避免直接加载 502 / 非飞牛音乐页面导致卡死
-  const verified = await verifyFnMusic(url);
-  if (!verified.ok) {
-    console.log('[submit-server] verify failed:', verified.error);
-    return { ok: false, error: verified.error };
+  // 在 loadURL 之前先验证：避免直接加载 502 / 非飞牛音乐页面导致卡死（resolve 内已验证则复用结果）
+  const v = verified || await verifyFnMusic(url);
+  if (!v.ok) {
+    console.log('[submit-server] verify failed:', v.error);
+    return { ok: false, error: v.error };
   }
+  // 重定向到新地址则用新地址访问
+  const finalUrl = v.finalUrl || url;
   // 访问码门禁：隐藏窗口后台过码（访问码传用户刚输入的值，此时配置尚未持久化）
-  if (verified.gate) {
-    const r = await passGateInBackground(url, accessCode);
+  if (v.gate) {
+    const r = await passGateInBackground(finalUrl, accessCode);
     if (r !== 'passed') {
       return {
         ok: false,
