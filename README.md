@@ -3,8 +3,14 @@
 > 基于 Electron 封装的飞牛音乐客户端，核心解决网页版无法后台播放、最小化后切歌中断的痛点。
 
 项目来源：<https://github.com/wbc389561407/fnmusic-exe>
-
-![img\_1.png](img_1.png)
+登录页
+![img.png](img.png)
+首页
+![img_2.png](img_2.png)
+音乐库
+![img_3.png](img_3.png)
+额外功能
+![img_4.png](img_4.png)
 
 ## 立项初衷
 
