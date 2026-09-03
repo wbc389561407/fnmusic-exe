@@ -55,8 +55,10 @@
     .wrap {
       height: 100%;
       display: flex;
+      flex-direction: column;
       align-items: center;
       justify-content: center;
+      padding: 16px 0;
       -webkit-app-region: no-drag;
     }
     .card {
@@ -69,6 +71,29 @@
       backdrop-filter: blur(14px);
       box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
       text-align: center;
+    }
+    /* 矮窗口：多级压缩间距与 logo，无滚动条也能一屏放下（窗口最小高度 600px） */
+    @media (max-height: 780px) {
+      .card { padding: 28px 44px 24px; }
+      .logo { width: 64px; height: 64px; border-radius: 16px; margin-bottom: 14px; }
+      h1 { font-size: 22px; }
+      .sub { margin-bottom: 18px; }
+      .version, .update-tip { margin-bottom: 18px; }
+      .field { margin-bottom: 12px; }
+      .hint { margin-top: 14px; }
+    }
+    @media (max-height: 660px) {
+      .card { padding: 18px 40px 14px; }
+      .logo { width: 44px; height: 44px; border-radius: 12px; margin-bottom: 8px; }
+      h1 { font-size: 18px; margin-bottom: 4px; }
+      .sub { font-size: 12px; margin-bottom: 10px; }
+      .version, .update-tip { font-size: 11px; margin-bottom: 10px; }
+      .field { margin-bottom: 8px; }
+      .field label { font-size: 12px; margin-bottom: 4px; }
+      input { padding: 9px 12px; font-size: 14px; }
+      .btn { padding: 10px; font-size: 14px; }
+      .msg { min-height: 16px; margin-top: 8px; font-size: 12px; }
+      .hint { margin-top: 8px; font-size: 11px; }
     }
     .logo {
       width: 96px;
@@ -163,10 +188,11 @@
       color: #ff8a8a;
     }
     .hint {
-      margin-top: 22px;
+      margin: 14px 0 0;
       font-size: 12px;
       color: #6f6889;
       line-height: 1.5;
+      text-align: center;
     }
     .hint a {
       color: #8a9bf0;
@@ -217,14 +243,10 @@
         <button class="btn" id="btn" type="submit">连接</button>
         <div class="msg" id="msg"></div>
       </form>
-
-      <p class="hint">
-        提示：可输入 fnid、IP 或完整网址<br />
-        fnid（如 your-fnid）优先走局域网直连，不通时再用中继 https://your-fnid.fnos.net/music/<br />
-        IP / 网址自动补协议与 /music 后缀<br />
-        项目地址：<a href="https://github.com/wbc389561407/fnmusic-exe" id="repo-link" target="_blank" rel="noopener">github.com/wbc389561407/fnmusic-exe</a>
-      </p>
     </div>
+    <p class="hint">
+      项目地址：<a href="https://github.com/wbc389561407/fnmusic-exe" id="repo-link" target="_blank" rel="noopener">github.com/wbc389561407/fnmusic-exe</a>
+    </p>
   </div>
 
   <script src="setup.js"></script>
