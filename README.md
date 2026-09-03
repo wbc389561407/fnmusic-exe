@@ -124,7 +124,7 @@ npm run dist:portable
 
 ## 版本号
 
-当前版本：**v3.0.1**
+当前版本：**v3.0.2**
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)（Semantic Versioning）：
 
@@ -138,7 +138,7 @@ npm run dist:portable
 
 ## 更新日志
 
-### v3.0.1
+### v3.0.2
 
 - 地址探测增强
 
