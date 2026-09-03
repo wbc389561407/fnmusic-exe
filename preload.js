@@ -27,6 +27,8 @@ contextBridge.exposeInMainWorld('serverBridge', {
   getSavedInput: () => ipcRenderer.invoke('get-saved-input'),
   // 登录接口返回错误时，渲染层通知主进程跳回设置页
   notifyLoginFail: () => ipcRenderer.invoke('login-fail'),
+  // 访问码错误（提交后仍停留在访问码页）时，渲染层通知主进程跳回设置页报错
+  notifyAccessCodeFail: () => ipcRenderer.invoke('access-code-fail'),
   // 设置页读取并清空待展示的登录错误提示
   getLoginError: () => ipcRenderer.invoke('get-login-error'),
   // 渲染层上报侧边栏歌单列表（MutationObserver 检测到变化时调用）

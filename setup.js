@@ -6,6 +6,7 @@
     var input = document.getElementById('url');
     var userEl = document.getElementById('username');
     var passEl = document.getElementById('password');
+    var codeEl = document.getElementById('accesscode');
     var btn = document.getElementById('btn');
     var msg = document.getElementById('msg');
 
@@ -44,7 +45,9 @@
       window.serverBridge.getLoginError().then(function (errMsg) {
         if (errMsg) {
           setMsg(errMsg, true);
-          if (passEl) passEl.focus();
+          // 访问码错误聚焦访问码输入框，其余聚焦密码输入框
+          if (errMsg.indexOf('访问码') >= 0 && codeEl) codeEl.focus();
+          else if (passEl) passEl.focus();
         }
       });
     }
@@ -72,6 +75,7 @@
       }
       var username = userEl ? userEl.value.trim() : '';
       var password = passEl ? passEl.value : '';
+      var accessCode = codeEl ? codeEl.value.trim() : '';
       if (!username) {
         setMsg('请输入用户名', true);
         userEl.focus();
@@ -86,20 +90,20 @@
       btn.textContent = '连接中...';
       setMsg('');
       try {
-        var res = await window.serverBridge.submit({ url: url, username: username, password: password });
+        var res = await window.serverBridge.submit({ url: url, username: username, password: password, accessCode: accessCode });
         if (!res || !res.ok) {
           setMsg((res && res.error) || '连接失败，请检查地址', true);
           btn.disabled = false;
           btn.textContent = '连接';
         } else {
-          // 成功：主进程会加载远程页面跳转。加 15 秒兜底，若页面仍未跳转则恢复按钮
+          // 成功：主进程会加载远程页面跳转。加 30 秒兜底（含后台过访问码门禁最多 20s），若页面仍未跳转则恢复按钮
           setTimeout(function () {
             if (document.getElementById('btn')) {
               btn.disabled = false;
               btn.textContent = '连接';
               setMsg('连接超时，请检查服务器是否在线', true);
             }
-          }, 15000);
+          }, 30000);
         }
       } catch (err) {
         setMsg('发生错误：' + (err.message || err), true);

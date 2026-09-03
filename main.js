@@ -264,8 +264,24 @@ function ensureMusicSuffix(url) {
 }
 
 // 验证目标地址是否为飞牛音乐服务
+// 页面分类：gate=访问码门禁页，fnmusic=飞牛音乐服务页，other=其他
+// 先判 gate：门禁页可能同时含服务名（如 <title>），必须优先命中
+function classifyPage(bodyText) {
+  const lower = (bodyText || '').toLowerCase();
+  if (lower.indexOf('请输入访问码') >= 0 || lower.indexOf('请输入访问密码') >= 0) return 'gate';
+  if (
+    lower.indexOf('飞牛音乐') >= 0 ||
+    lower.indexOf('fnmusic') >= 0 ||
+    lower.indexOf('fnos-music') >= 0
+  ) return 'fnmusic';
+  return 'other';
+}
+
 // 在 loadURL 之前做一次 HTTP 请求探测，避免直接加载 502 / 非飞牛音乐页面导致卡死
-// 返回 { ok: true } 或 { ok: false, error: string }
+// 返回：
+// - 飞牛音乐页 → { ok: true, gate: false }
+// - 访问码门禁页 → { ok: true, gate: true }（过码由 passGateInBackground 后台完成）
+// - 其他页面 → { ok: false, error }
 // 使用原生 http/https 模块而不是 fetch，确保能控制 SSL 证书验证（fnos.net/局域网 IP 允许自签）
 function verifyFnMusic(targetUrl) {
   return new Promise((resolve) => {
@@ -351,7 +367,7 @@ function verifyFnMusic(targetUrl) {
             // 超限：认为页面存在，不再继续校验（SPA 首屏通常 < 500KB）
             res.destroy();
             // 超限且状态码正常 → 认为是合法服务
-            if (status >= 200 && status < 400) resolve({ ok: true });
+            if (status >= 200 && status < 400) resolve({ ok: true, gate: false });
             else resolve({ ok: false, error: '服务器响应过大，无法校验' });
             return;
           }
@@ -366,25 +382,21 @@ function verifyFnMusic(targetUrl) {
           }
           console.log('[verifyFnMusic] status:', status, 'url:', currentUrl, 'bodyLen:', bodyText.length);
 
-          const lower = bodyText.toLowerCase();
-          const hasMusicMarkers =
-            lower.indexOf('飞牛音乐') >= 0 ||
-            lower.indexOf('fnmusic') >= 0 ||
-            lower.indexOf('fnos-music') >= 0 ||
-            lower.indexOf('music center') >= 0 ||
-            lower.indexOf('音乐中心') >= 0 ||
-            /\/music\/assets\//.test(lower) ||
-            /\/music\/_nuxt\//.test(lower) ||
-            /\/music\/static\//.test(lower) ||
-            (lower.indexOf('login') >= 0 &&
-              lower.indexOf('password') >= 0 &&
-              (lower.indexOf('/music') >= 0 || lower.indexOf('音乐') >= 0));
-
-          if (status >= 200 && status < 400 && !hasMusicMarkers) {
-            resolve({ ok: false, error: '该地址不是飞牛音乐服务，请检查地址是否正确' });
+          // 只放行飞牛音乐页与访问码门禁页（门禁页由 passGateInBackground 后台过码）
+          const kind = classifyPage(bodyText);
+          if (kind === 'fnmusic') {
+            resolve({ ok: true, gate: false });
             return;
           }
-          resolve({ ok: true });
+          if (kind === 'gate') {
+            resolve({ ok: true, gate: true });
+            return;
+          }
+          if (status >= 200 && status < 400) {
+            resolve({ ok: false, error: '该地址不是飞牛音乐服务，请检查地址是否正确' });
+          } else {
+            resolve({ ok: false, error: '服务器响应异常（' + status + '），无法确认是飞牛音乐服务' });
+          }
         });
         res.on('error', (e) => {
           console.log('[verifyFnMusic] response error:', e.message);
@@ -415,6 +427,116 @@ function verifyFnMusic(targetUrl) {
   });
 }
 
+// 后台过访问码门禁：用隐藏 BrowserWindow 加载门禁页并自动填码提交
+// - 与主窗口共用 PARTITION，过码 cookie 自动共享，主窗口 loadURL 直达音乐/登录页（门禁页不显示）
+// - DOM 层模拟真实输入（input/change 事件 + 点击确定），兼容 form / fetch / XHR 各种提交实现
+// 返回：'passed'（通过）/ 'wrong-code'（访问码错误或超时）/ 'no-code'（未配置访问码）
+function passGateInBackground(url, accessCode) {
+  return new Promise((resolve) => {
+    const code = (typeof accessCode === 'string' && accessCode.trim())
+      ? accessCode.trim()
+      : (readConfig().accessCode || '').trim();
+    if (!code) {
+      resolve('no-code');
+      return;
+    }
+
+    let settled = false;
+    let pollTimer = null;
+    let gateWin = null;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (pollTimer) clearInterval(pollTimer);
+      if (gateWin && !gateWin.isDestroyed()) gateWin.destroy();
+      console.log('[passGateInBackground] result:', result);
+      resolve(result);
+    };
+    // 总超时 20 秒：提交后仍停留在门禁页 = 访问码错误
+    setTimeout(() => finish('wrong-code'), 20000);
+
+    gateWin = new BrowserWindow({
+      show: false,
+      webPreferences: {
+        partition: PARTITION,
+        contextIsolation: true,
+        nodeIntegration: false,
+        // 隐藏窗口不被后台节流，保证看门狗定时器正常跑
+        backgroundThrottling: false
+      }
+    });
+
+    // 页面状态检查：标题已渲染且不再是门禁 → 已通过
+    function checkPassed() {
+      if (settled || !gateWin || gateWin.isDestroyed()) return;
+      gateWin.webContents.executeJavaScript(`
+        (function(){
+          var t = '';
+          var h = document.querySelector('#page-title') || document.querySelector('h1');
+          if (h) t = (h.textContent || '').trim();
+          if (!t) t = (document.title || '').trim();
+          if (!t) return { known: false };
+          return { known: true, gate: t.indexOf('访问码') !== -1 || t.indexOf('访问密码') !== -1 };
+        })();
+      `).then((st) => {
+        if (settled) return;
+        if (st && st.known && !st.gate) finish('passed');
+      }).catch(() => {});
+    }
+
+    // 看门狗：命中门禁页自动填码并点击「确定」（最多 2 次，间隔 4 秒）
+    gateWin.webContents.on('dom-ready', () => {
+      gateWin.webContents.executeJavaScript(`
+        (function(){
+          if (window.__fnGateWatchdog) return;
+          window.__fnGateWatchdog = true;
+          var CODE = ${JSON.stringify(code)};
+          var submits = 0, lastAt = 0;
+          function isGate(){
+            var h = document.querySelector('#page-title') || document.querySelector('h1');
+            if (!h) return false;
+            var t = (h.textContent || '').trim();
+            return t.indexOf('访问码') !== -1 || t.indexOf('访问密码') !== -1;
+          }
+          function submitGate(){
+            var inputs = document.querySelectorAll('input');
+            var input = null;
+            for (var i = 0; i < inputs.length; i++) {
+              var el = inputs[i];
+              var ty = (el.type || 'text').toLowerCase();
+              if (ty !== 'password' && ty !== 'text') continue;
+              var r = el.getBoundingClientRect();
+              if (r.width <= 0 && r.height <= 0) continue;
+              input = el;
+              if (ty === 'password') break;
+            }
+            if (!input) return false;
+            var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            setter.call(input, CODE);
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            setTimeout(function(){
+              var btn = document.querySelector('button[type="submit"]') || document.querySelector('button');
+              if (btn && !btn.disabled) btn.click();
+            }, 350);
+            return true;
+          }
+          setInterval(function(){
+            if (!isGate()) return;
+            if (submits >= 2) return;
+            var now = Date.now();
+            if (lastAt && now - lastAt < 4000) return;
+            if (submitGate()) { submits++; lastAt = now; }
+          }, 500);
+        })();
+      `).catch(() => {});
+    });
+
+    pollTimer = setInterval(checkPassed, 800);
+    gateWin.loadURL(url, { userAgent: UA }).catch(() => finish('wrong-code'));
+  });
+}
+
 let mainWindow = null;
 let tray = null;
 // 从远程页面读取到的歌单名称列表（用户创建的自定义歌单）
@@ -426,6 +548,9 @@ let isQuitting = false;
 let loginFailTimer = null;
 // 待展示给设置页的登录错误提示（设置页读取后清空）
 let pendingLoginError = '';
+// 访问码看门狗注入计数：单次连接周期内累计上限 2 次，用尽仍见门禁页 = 访问码错误
+// （防无限循环）；重新连接或到达正常页面时清零
+let accessCodeSubmits = 0;
 
 // 基准窗口高度（在该高度下页面竖直方向无滚动条）
 const BASE_HEIGHT = 1150;
@@ -722,6 +847,139 @@ function tryAutoLogin() {
       }
     } catch {}
   }, 8000);
+}
+
+// 访问码自动填入：服务器开启访问码保护时，先加载到「请输入访问码」页面
+// 注入常驻看门狗持续轮询（覆盖标题/表单晚渲染、SPA 路由切换），命中访问码页即填码并点击「确定」，
+// 通过后服务器自动跳转到登录页/音乐页，后续自动登录、启动页、自动播放流程照常触发
+// - 输入框：密码框优先，其次可见的文本类输入框（排除隐藏字段）
+// - 填码后延迟 350ms 再点击（等框架同步状态、按钮解禁）；提交后 4s 未跳转自动重试
+// - 单页面最多提交 2 次；整周期累计注入上限 4 次，防访问码错误时无限循环
+function tryAutoAccessCode() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  let currentUrl = '';
+  try { currentUrl = mainWindow.webContents.getURL(); } catch {}
+  if (!/^https?:/i.test(currentUrl)) return; // 仅远程页面处理
+
+  const cfg = readConfig();
+  const code = (cfg.accessCode || '').trim();
+  if (!code) return; // 未配置访问码则不处理
+
+  const allowed = accessCodeSubmits < 2;
+  const codeJson = JSON.stringify(code);
+  mainWindow.webContents.executeJavaScript(`
+    (function(){
+      if (window.__fnAccessCodeWatchdog) return 'started';
+      // 页面明确不是访问码页（标题已渲染且不匹配）：不装看门狗，并通知主进程清零计数
+      var h0 = document.querySelector('#page-title') || document.querySelector('h1');
+      if (h0) {
+        var t0 = (h0.textContent || '').trim();
+        if (t0 && t0.indexOf('访问码') === -1 && t0.indexOf('访问密码') === -1) return 'skip';
+      }
+      // 注入配额用尽（此前已提交多次仍未通过）：确认仍停留在门禁页 = 访问码错误
+      if (!${allowed}) {
+        (function confirmGate(tries){
+          tries++;
+          var h = document.querySelector('#page-title') || document.querySelector('h1');
+          var t = h ? (h.textContent || '').trim() : '';
+          if (!t) { if (tries < 16) setTimeout(function(){ confirmGate(tries); }, 300); return; }
+          if (t.indexOf('访问码') !== -1 || t.indexOf('访问密码') !== -1) notifyFail();
+        })(0);
+        return 'blocked';
+      }
+      window.__fnAccessCodeWatchdog = true;
+      var OPT = { code: ${codeJson} };
+      var MAX_SUBMITS = 2;
+      var RETRY_AFTER_MS = 4000;
+      var submits = 0;
+      var lastSubmitAt = 0;
+
+      function isGatePage(){
+        var h1 = document.querySelector('#page-title') || document.querySelector('h1');
+        if (!h1) return false;
+        var t = (h1.textContent || '').trim();
+        return t.indexOf('访问码') !== -1 || t.indexOf('访问密码') !== -1;
+      }
+      // 访问码错误：通知主进程跳回设置页报错（同文档只通知一次）
+      function notifyFail(){
+        if (window.__fnAccessCodeFailed) return;
+        window.__fnAccessCodeFailed = true;
+        try {
+          if (window.serverBridge && typeof window.serverBridge.notifyAccessCodeFail === 'function') {
+            window.serverBridge.notifyAccessCodeFail();
+          }
+        } catch (e) {}
+      }
+      function findInput(){
+        var inputs = document.querySelectorAll('input');
+        var best = null;
+        for (var i = 0; i < inputs.length; i++) {
+          var el = inputs[i];
+          var ty = (el.type || 'text').toLowerCase();
+          if (ty === 'hidden' || ty === 'checkbox' || ty === 'radio' || ty === 'file' || ty === 'submit' || ty === 'button') continue;
+          var rect = el.getBoundingClientRect();
+          if (rect.width <= 0 && rect.height <= 0) continue; // 不可见（隐藏字段）跳过
+          if (ty === 'password') return el;
+          if (!best) best = el;
+        }
+        return best;
+      }
+      function findButton(){
+        var btns = document.querySelectorAll('button, input[type="submit"]');
+        var fallback = null;
+        for (var i = 0; i < btns.length; i++) {
+          var el = btns[i];
+          if (el.disabled) continue;
+          var rect = el.getBoundingClientRect();
+          if (rect.width <= 0 && rect.height <= 0) continue;
+          if (el.type === 'submit') return el;
+          if (!fallback) fallback = el;
+        }
+        return fallback;
+      }
+      function submitGate(){
+        var input = findInput();
+        if (!input) return false;
+        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(input, OPT.code);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        // 延迟点击：等框架把输入同步进状态（按钮可能由禁用转为可用）
+        setTimeout(function(){
+          var b = findButton();
+          if (b && !b.disabled) b.click();
+          else if (input.form && input.form.requestSubmit) input.form.requestSubmit();
+        }, 350);
+        return true;
+      }
+      // 注入时立即先提交一次（dom-ready 阶段执行，门禁页几乎不可见）
+      if (isGatePage() && submitGate()) {
+        submits++;
+        lastSubmitAt = Date.now();
+      }
+      var timer = setInterval(function(){
+        if (submits >= MAX_SUBMITS) {
+          // 提交次数用尽且等待超时仍停留在门禁页：访问码错误 → 跳回设置页报错
+          if (isGatePage() && lastSubmitAt && Date.now() - lastSubmitAt >= RETRY_AFTER_MS) {
+            clearInterval(timer);
+            notifyFail();
+          }
+          return;
+        }
+        if (!isGatePage()) return;
+        var now = Date.now();
+        if (lastSubmitAt && now - lastSubmitAt < RETRY_AFTER_MS) return; // 等页面跳转
+        if (submitGate()) {
+          submits++;
+          lastSubmitAt = Date.now();
+        }
+      }, 600);
+      return 'watchdog';
+    })();
+  `).then((status) => {
+    if (status === 'watchdog') accessCodeSubmits++;
+    else if (status === 'skip') accessCodeSubmits = 0;
+  }).catch(() => {});
 }
 
 // 登录成功进入主页后，自动点击一次启动页配置对应的侧边栏导航项
@@ -1308,6 +1566,8 @@ function createWindow() {
       })();
     `).catch(() => {});
 
+    // 访问码自动填入（通过访问码门禁后才能进入登录/主页面）
+    tryAutoAccessCode();
     // 切换到配置的启动页 + 自动播放 + 自动登录
     tryClickStartupNav();
     tryAutoPlay();
@@ -1317,6 +1577,7 @@ function createWindow() {
   // SPA 路由切换（如 cookie 失效跳到 /login，或自动登录后跳回主页）
   // did-finish-load 不会触发，需监听 did-navigate-in-page
   mainWindow.webContents.on('did-navigate-in-page', () => {
+    tryAutoAccessCode();
     tryClickStartupNav();
     tryAutoLogin();
     tryAutoPlay();
@@ -1406,6 +1667,17 @@ function createWindow() {
         pendingLoginError = verified.error;
         loadSetup();
         return;
+      }
+      // 访问码门禁：隐藏窗口后台过码，主窗口不显示门禁页
+      if (verified.gate) {
+        const r = await passGateInBackground(url);
+        if (r !== 'passed') {
+          pendingLoginError = r === 'no-code'
+            ? '服务器开启了访问码保护，请在访问密码栏填写后重试'
+            : '访问码错误，请检查访问密码后重新连接';
+          loadSetup();
+          return;
+        }
       }
       applyServerUrl(url);
     });
@@ -1497,6 +1769,7 @@ function applyServerUrl(rawUrl) {
     allowedOrigin = null;
   }
   lastServerUrl = url;
+  accessCodeSubmits = 0; // 新的连接周期：重置访问码提交计数
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.loadURL(url, { userAgent: UA }, (err) => {
       if (err) console.log('[applyServerUrl] loadURL error:', err.code, err.message);
@@ -1526,7 +1799,14 @@ function logoutAccount() {
 // 返回已保存的服务器地址与用户名，供设置页预填（退出登录后保留输入历史）
 ipcMain.handle('get-saved-input', () => {
   const cfg = readConfig();
-  return { url: cfg.serverInput || '', username: cfg.username || '' };
+  return { url: cfg.serverInput || '', username: cfg.username || '', accessCode: cfg.accessCode || '' };
+});
+
+// 访问码错误（多次提交后仍停留在访问码页）：跳回设置页并在访问码输入框处报错
+ipcMain.handle('access-code-fail', () => {
+  pendingLoginError = '访问码错误，请检查访问密码后重新连接';
+  loadSetup();
+  return true;
 });
 
 // 登录接口返回错误：渲染层 hook 检测到失败后通知主进程，立即跳回设置页并带错误提示
@@ -1552,6 +1832,7 @@ ipcMain.handle('submit-server', async (event, payload) => {
     : (payload && payload.url ? payload.url : '').trim();
   const username = (payload && typeof payload === 'object' ? (payload.username || '').trim() : '');
   const password = (payload && typeof payload === 'object' ? (payload.password || '') : '');
+  const accessCode = (payload && typeof payload === 'object' ? (payload.accessCode || '').trim() : '');
 
   const { url, error } = await resolveAccessUrl(input);
   if (!url) {
@@ -1564,12 +1845,27 @@ ipcMain.handle('submit-server', async (event, payload) => {
     console.log('[submit-server] verify failed:', verified.error);
     return { ok: false, error: verified.error };
   }
+  // 访问码门禁：隐藏窗口后台过码（访问码传用户刚输入的值，此时配置尚未持久化）
+  if (verified.gate) {
+    const r = await passGateInBackground(url, accessCode);
+    if (r !== 'passed') {
+      return {
+        ok: false,
+        error: r === 'no-code'
+          ? '服务器开启了访问码保护，请在访问密码栏填写后重试'
+          : '访问码错误，请检查访问密码后重新连接'
+      };
+    }
+  }
 
   // 持久化用户原始输入与登录凭据，下次启动重新解析
   const cfg = readConfig();
   cfg.serverInput = input;
   if (username) cfg.username = username;
   if (password) cfg.password = password;
+  // 访问码选填：填了保存，清空则移除
+  if (accessCode) cfg.accessCode = accessCode;
+  else delete cfg.accessCode;
   writeConfig(cfg);
   applyServerUrl(url);
   return { ok: true };
