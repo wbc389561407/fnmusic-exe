@@ -90,7 +90,8 @@ function normalizeUrl(input) {
 
 // ===== fnid 解析（通过 fnos.net 远程访问 API 获取真实服务器地址）=====
 // 逆向自 fnos.net 前端 JS，API 需同时携带两套签名
-// 候选地址优先级：局域网 http（最快，无证书问题）> fnos.net 中继 https（兜底）
+// 候选地址顺序：局域网 http 在前（通常最快、无证书问题），fnos.net 中继 https 在后；
+// 全部候选并发探测、先通先用（见 probeCandidates），此顺序仅影响全部失败时的错误提示
 // 不考虑公网 IP 直连（家庭网络绝大多数无公网 IP，且公网 IP 直连意义不大）
 const FNOS_PREFIX = 'NDzZTVxnRKP8Z0jXg1VAMonaG8akvh';
 const FNOS_API_KEY = 'zIGtkc3dqZnJpd29qZXJqa2w7c';
@@ -107,7 +108,7 @@ function isFnid(input) {
 }
 
 // 通过 fnid 调用 fnos.net API 解析真实服务器地址
-// 返回候选地址列表（按优先级排序）：局域网 http > fnos.net 中继 https 兜底
+// 返回候选地址列表：局域网 http 在前，fnos.net 中继 https 在后（并发探测，先通先用）
 // API 返回数据示例：
 //   { ipv4: ["192.168.x.x"], publicIpv4: ["x.x.x.x"], fn: ["your-fnid.fnos.net:443"],
 //     port: { httpPort: 40710, httpsPort: 40711 } }
@@ -179,36 +180,49 @@ async function resolveFnid(fnid) {
   }
 }
 
-// 顺序验证候选地址：逐个补 /music/ 后用 verifyFnMusic 完整验证（跟随重定向 + 页面识别）
+// 并发验证候选地址：逐个补 /music/ 后并发调 verifyFnMusic 完整验证（跟随重定向 + 页面识别 + IPv4/IPv6 兜底），
+// 任一候选先验证通过立即采用（先通先用），返回其重定向后的最终真实地址
 // - 覆盖局域网 http 与 https 中继：verifyFnMusic 对 fnos.net / 局域网 IP 放行自签证书，可安全探测 https
-// - 「可达但不是音乐服务」的候选（如 5666 端口跑着别的服务）会被拒绝并继续尝试下一个
+// - 「可达但不是音乐服务」的候选（如 5666 端口跑着别的服务）验证不通过，自动在竞速中落败
 // - fnos.net 中继候选：入口为 SPA 壳无法识别时 2xx 即放行，沿用原始中继地址（见 verifyFnMusic）
-// - 第一个验证通过的候选生效，返回其重定向后的最终地址（重定向到新地址则用新地址访问）
+// - 全部失败时返回第一个候选（优先级最高）的错误，提示更直观；胜出后其余探测自然结束（仅少数 HTTP 请求，不取消）
 // 返回 { url, verified }（成功）或 { url: null, error }（全部失败）
 async function probeCandidates(candidates) {
-  let lastError = null;
-  for (const cand of candidates) {
-    const url = ensureMusicSuffix(cand);
-    if (!url) {
-      lastError = '地址格式无效';
-      continue;
-    }
-    console.log('[probeCandidates] try ->', url);
-    const verified = await verifyFnMusic(url);
-    if (verified.ok) {
-      const finalUrl = verified.finalUrl || url;
-      console.log('[probeCandidates] verified:', url, '->', finalUrl);
-      return { url: finalUrl, verified };
-    }
-    lastError = verified.error;
-    console.log('[probeCandidates] failed:', url, '-', verified.error);
-  }
-  return { url: null, error: lastError || '所有候选地址均不可达，请检查网络或使用网址登录' };
+  // 规范化候选：补 /music/ 后缀（幂等，已带后缀安全），过滤无效项
+  const urls = candidates.map((cand) => ensureMusicSuffix(cand)).filter(Boolean);
+  if (urls.length === 0) return { url: null, error: '地址格式无效' };
+
+  // verifyFnMusic 只 resolve 不 reject；首个 ok 立即定稿，失败计数等全部完成
+  return new Promise((resolve) => {
+    let settled = false;
+    let failed = 0;
+    const errors = [];
+    urls.forEach((url, i) => {
+      console.log('[probeCandidates] try ->', url);
+      verifyFnMusic(url).then((verified) => {
+        if (settled) return;
+        if (verified.ok) {
+          settled = true;
+          const finalUrl = verified.finalUrl || url;
+          console.log('[probeCandidates] verified:', url, '->', finalUrl);
+          resolve({ url: finalUrl, verified });
+          return;
+        }
+        errors[i] = verified.error;
+        console.log('[probeCandidates] failed:', url, '-', verified.error);
+        failed++;
+        if (failed === urls.length) {
+          settled = true;
+          resolve({ url: null, error: errors[0] || '所有候选地址均不可达，请检查网络或使用网址登录' });
+        }
+      });
+    });
+  });
 }
 
 // 统一解析用户输入为可访问地址（异步：fnid 分支需要调用远程 API）
-// - fnid：调 fnos.net API 获取候选 → 逐候选完整验证（局域网 http 优先，https 中继兜底），用重定向后最终地址
-// - 不带协议且不带端口的域名 / IP：先试 http 默认端口，不通再补 5666 端口（飞牛 NAS 默认端口）
+// - fnid：调 fnos.net API 获取候选（局域网 http 在前，https 中继在后）→ 全部候选并发完整验证，先通先用，用重定向后最终地址
+// - 不带协议且不带端口的域名 / IP：默认端口与 5666 端口（飞牛 NAS 默认端口）并发探测，先通先用
 // - 带协议 / 带端口：完全尊重用户输入，单地址验证
 // - 验证时跟随重定向，重定向到新地址则用新地址访问
 // 返回 { url, error, verified }，url 非空即可直接访问；verified 为内部已完成的验证结果（外层可复用，避免重复请求）
@@ -233,37 +247,27 @@ async function resolveAccessUrl(input) {
   const base = normalizeUrl(s);
   if (!base) return { url: null, error: '地址无效，请检查后重试' };
 
-  // 构造候选地址列表（均补 /music/ 后缀）
-  const first = ensureMusicSuffix(base);
-  if (!first) return { url: null, error: '地址格式无效' };
-  const candidates = [first];
+  // 构造候选地址列表（/music/ 后缀由 probeCandidates 统一追加）
+  const candidates = [base];
 
-  // 仅「不带协议且不带端口」的输入追加 5666 候选：先试默认端口，不通再补 5666
+  // 仅「不带协议且不带端口」的输入追加 5666 候选：与默认端口并发探测，先通先用
   const hasProto = /^https?:\/\//i.test(s);
   try {
     const u = new URL(base);
     if (!hasProto && !u.port) {
       const u2 = new URL(base);
       u2.port = '5666';
-      const second = ensureMusicSuffix(u2.href);
-      if (second && second !== first) candidates.push(second);
+      if (u2.href !== base) candidates.push(u2.href);
     }
   } catch {}
 
-  // 顺序验证候选：第一个通过即用；验证跟随重定向，用重定向后的新地址
-  let lastError = null;
-  for (const cand of candidates) {
-    console.log('[resolveAccessUrl] try ->', cand);
-    const verified = await verifyFnMusic(cand);
-    if (verified.ok) {
-      const finalUrl = verified.finalUrl || cand;
-      console.log('[resolveAccessUrl] address ->', finalUrl);
-      return { url: finalUrl, error: null, verified };
-    }
-    lastError = verified.error;
-    console.log('[resolveAccessUrl] failed:', cand, '-', verified.error);
+  // 并发验证候选：先通过者生效；验证跟随重定向，用重定向后的最终真实地址
+  const { url, verified, error } = await probeCandidates(candidates);
+  if (!url) {
+    return { url: null, error: error || '无法连接到服务器，请检查地址或网络' };
   }
-  return { url: null, error: lastError || '无法连接到服务器，请检查地址或网络' };
+  console.log('[resolveAccessUrl] address ->', url);
+  return { url, error: null, verified };
 }
 
 // 自动补 /music/ 后缀（带尾斜杠）
@@ -310,7 +314,21 @@ function isFnosRelayHost(host) {
 // fnos.net 中继特例：中继入口返回的是 FN Connect SPA 壳（需执行 JS 建立中继会话，HTTP 层拿不到
 // 飞牛音乐关键词）→ 拿到 2xx 响应即放行，且沿用原始中继地址（跳转与 JS 交给 BrowserWindow 处理）
 // 使用原生 http/https 模块而不是 fetch，确保能控制 SSL 证书验证（fnos.net/局域网 IP 允许自签）
+// IPv4 优先、IPv6 兜底：Node 18 的 http.request 无 Happy Eyeballs 自动回退
+// （net.getDefaultAutoSelectFamily() === false），Win11 上 dns.lookup 可能返回 IPv6 优先地址，
+// 若域名有 AAAA 记录但 IPv6 链路不通，会一直卡到超时（浏览器有自动回落所以能正常打开，
+// 表现为「仅本客户端连不上」）。先用 family=4 验证，仅当连接层失败（DNS 解析失败 / 超时 /
+// 连接被拒等，证书错误与已收到响应的错误除外）时再用 family=6 兜底重试一次。
 function verifyFnMusic(targetUrl) {
+  return verifyFnMusicOnce(targetUrl, 4).then((r) => {
+    if (r.ok || !r.retryable) return r;
+    console.log('[verifyFnMusic] IPv4 attempt failed:', r.error, '-> retry with IPv6');
+    return verifyFnMusicOnce(targetUrl, 6).then((r6) => (r6.ok ? r6 : r));
+  });
+}
+
+// 单栈单次验证（verifyFnMusic 的内部实现）：family 指定本次连接使用的协议栈（4=IPv4，6=IPv6）
+function verifyFnMusicOnce(targetUrl, family) {
   return new Promise((resolve) => {
     const MAX_REDIRECTS = 10;
     const TIMEOUT_MS = 12000;
@@ -341,6 +359,7 @@ function verifyFnMusic(targetUrl) {
         port: parsed.port || (isHttps ? 443 : 80),
         path: parsed.pathname + parsed.search,
         method: 'GET',
+        family: family,
         headers: {
           'User-Agent': UA,
           'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
@@ -455,10 +474,11 @@ function verifyFnMusic(targetUrl) {
           return;
         }
         if (e.message === 'timeout') {
-          resolve({ ok: false, error: '连接超时，请检查服务器地址或网络' });
+          resolve({ ok: false, error: '连接超时，请检查服务器地址或网络', retryable: true });
           return;
         }
-        resolve({ ok: false, error: '无法连接到服务器，请检查地址或网络' });
+        // 连接层失败（DNS 解析失败 / 连接被拒 / 网络不可达等）→ 标记可换 IPv6 栈重试
+        resolve({ ok: false, error: '无法连接到服务器，请检查地址或网络', retryable: true });
       });
       req.end();
     }
