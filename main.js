@@ -810,15 +810,18 @@ function injectFetchInterceptor() {
               resp.clone().text().then(function(body){
                 try {
                   var data = JSON.parse(body);
+                  var trackGUID = (url.match(/trackGUID=([^&]+)/) || [])[1] || '';
                   if (data.code === 0 && data.data && data.data.list && data.data.list.length > 0) {
                     // 取第一个歌词（可能有多个版本）
                     var lyric = data.data.list[0];
-                    var trackGUID = (url.match(/trackGUID=([^&]+)/) || [])[1] || '';
                     window.__fnCurrentLyric = {
                       trackGUID: trackGUID,
                       content: lyric.content || '',
                       source: lyric.source
                     };
+                  } else {
+                    // 没有歌词数据，也更新缓存标记为空，避免残留上一首的歌词
+                    window.__fnCurrentLyric = { trackGUID: trackGUID, content: '', source: '' };
                   }
                 } catch {}
               }).catch(function(){});
@@ -884,6 +887,12 @@ function startLyricPolling() {
         // 3. 读取拦截器缓存的歌词和歌曲信息
         var lyric = window.__fnCurrentLyric || null;
         var track = window.__fnCurrentTrack || null;
+
+        // 3.5 检测歌曲切换：如果 track.guid 和缓存的歌词 trackGUID 不一致，说明切歌了但歌词缓存还是旧的，清除旧缓存
+        if (lyric && track && track.guid && lyric.trackGUID && track.guid !== lyric.trackGUID) {
+          window.__fnCurrentLyric = null;
+          lyric = null;
+        }
 
         // 4. 读取歌曲标题（从底部播放栏，作为后备）
         var songTitle = '';
@@ -990,10 +999,8 @@ function startLyricPolling() {
             // 还没到第一行歌词的时间
             if (currentLyricLines.length > 0) next = currentLyricLines[0].text;
           }
-        } else if (currentSongTitle) {
-          // 没有歌词时显示歌曲名
-          current = currentSongTitle;
         }
+        // 没有歌词时 current/prev/next 均为空，渲染端会显示"无歌词"
 
         lyricWindow.webContents.send('lyric-update', {
           current: current,
