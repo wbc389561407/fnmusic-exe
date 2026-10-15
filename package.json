@@ -31,6 +31,8 @@
       "preload.js",
       "setup.html",
       "setup.js",
+      "desktop-lyric.html",
+      "desktop-lyric.js",
       "build/icon.png",
       "build/icon.ico"
     ],

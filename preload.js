@@ -1,5 +1,6 @@
 // preload: 通过 contextBridge 向渲染层暴露受控的 IPC 接口
 // setup.html 用 serverBridge.submit 提交服务器地址
+// desktop-lyric.html 用 desktopLyricBridge 接收歌词更新与控制播放
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('serverBridge', {
@@ -33,6 +34,18 @@ contextBridge.exposeInMainWorld('serverBridge', {
   getLoginError: () => ipcRenderer.invoke('get-login-error'),
   // 渲染层上报侧边栏歌单列表（MutationObserver 检测到变化时调用）
   reportPlaylists: (names) => ipcRenderer.send('playlists-updated', names)
+});
+
+// 桌面歌词窗口专用桥接接口
+contextBridge.exposeInMainWorld('desktopLyricBridge', {
+  // 接收歌词更新 { current, prev, next, playing }
+  onUpdate: (cb) => ipcRenderer.on('lyric-update', (_e, data) => cb(data)),
+  // 请求当前歌词（触发主进程立即轮询一次）
+  requestLyrics: () => ipcRenderer.invoke('request-lyrics'),
+  // 播放控制：prev / next / play-pause
+  control: (action) => ipcRenderer.invoke('lyric-control', action),
+  // 关闭桌面歌词
+  close: () => ipcRenderer.invoke('close-desktop-lyric')
 });
 
 // 阻止页面默认拖拽打开文件的行为

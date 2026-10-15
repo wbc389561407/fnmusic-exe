@@ -599,6 +599,10 @@ function passGateInBackground(url, accessCode) {
 
 let mainWindow = null;
 let tray = null;
+// 桌面歌词独立窗口
+let lyricWindow = null;
+// 桌面歌词是否启用（持久化）
+let desktopLyricEnabled = false;
 // 从远程页面读取到的歌单名称列表（用户创建的自定义歌单）
 let cachedPlaylists = [];
 // 是否处于「真正退出」流程：托盘右键退出 / window-all-closed 时置 true，
@@ -611,6 +615,458 @@ let pendingLoginError = '';
 // 访问码看门狗注入计数：单次连接周期内累计上限 2 次，用尽仍见门禁页 = 访问码错误
 // （防无限循环）；重新连接或到达正常页面时清零
 let accessCodeSubmits = 0;
+
+// ===== 桌面歌词窗口 =====
+// 读取桌面歌词开关状态（持久化）
+function getDesktopLyricEnabled() {
+  const cfg = readConfig();
+  return cfg.desktopLyric === true;
+}
+
+// 创建桌面歌词独立窗口：透明、无边框、置顶、可拖动
+function createLyricWindow() {
+  if (lyricWindow && !lyricWindow.isDestroyed()) return;
+
+  const { screen } = require('electron');
+  const display = screen.getPrimaryDisplay();
+  const workArea = display.workArea;
+
+  // 读取保存的位置，否则默认居中靠下
+  const cfg = readConfig();
+  let x = cfg.lyricX;
+  let y = cfg.lyricY;
+  const w = 720, h = 160;
+  if (typeof x !== 'number' || typeof y !== 'number') {
+    x = Math.round(workArea.x + (workArea.width - w) / 2);
+    y = Math.round(workArea.y + workArea.height - h - 80);
+  }
+
+  lyricWindow = new BrowserWindow({
+    width: w,
+    height: h,
+    x: x,
+    y: y,
+    frame: false,
+    transparent: true,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    show: false,
+    hasShadow: false,
+    // 鼠标穿透区域由 setIgnoreMouseEvents(false) 配合页面 -webkit-app-region 控制
+    // 不使用 setIgnoreMouseEvents(true)，否则无法拖动
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      backgroundThrottling: false
+    }
+  });
+
+  lyricWindow.loadFile(path.join(__dirname, 'desktop-lyric.html'));
+  lyricWindow.once('ready-to-show', () => {
+    lyricWindow.show();
+  });
+
+  // 拖动结束后保存位置
+  let moveTimer = null;
+  lyricWindow.on('move', () => {
+    if (moveTimer) clearTimeout(moveTimer);
+    moveTimer = setTimeout(() => {
+      if (!lyricWindow || lyricWindow.isDestroyed()) return;
+      const [px, py] = lyricWindow.getPosition();
+      const c = readConfig();
+      c.lyricX = px;
+      c.lyricY = py;
+      writeConfig(c);
+    }, 300);
+  });
+
+  lyricWindow.on('closed', () => {
+    lyricWindow = null;
+  });
+
+  // 桌面歌词窗口不拦截关闭：直接销毁
+  lyricWindow.on('close', (e) => {
+    // 允许关闭
+  });
+}
+
+// 显示桌面歌词
+function showDesktopLyric() {
+  desktopLyricEnabled = true;
+  const cfg = readConfig();
+  cfg.desktopLyric = true;
+  writeConfig(cfg);
+  if (!lyricWindow || lyricWindow.isDestroyed()) {
+    createLyricWindow();
+  } else {
+    lyricWindow.show();
+  }
+  // 启动歌词读取
+  startLyricPolling();
+  if (tray) tray.setContextMenu(buildTrayMenu());
+}
+
+// 隐藏桌面歌词
+function hideDesktopLyric() {
+  desktopLyricEnabled = false;
+  const cfg = readConfig();
+  cfg.desktopLyric = false;
+  writeConfig(cfg);
+  stopLyricPolling();
+  if (lyricWindow && !lyricWindow.isDestroyed()) {
+    lyricWindow.destroy();
+    lyricWindow = null;
+  }
+  if (tray) tray.setContextMenu(buildTrayMenu());
+}
+
+// 切换桌面歌词显示/隐藏
+function toggleDesktopLyric() {
+  if (desktopLyricEnabled) hideDesktopLyric();
+  else showDesktopLyric();
+}
+
+// 桌面歌词：新方案 —— 直接获取完整 LRC 歌词 + 播放进度，不依赖全屏面板
+let lyricPollTimer = null;
+// 当前歌曲信息缓存
+let currentTrackGUID = null;
+let currentLyricRaw = null;      // LRC 原始文本
+let currentLyricLines = null;     // 解析后的歌词行 [{ time: 秒, text: "歌词" }]
+let currentSongTitle = '';
+let currentSongArtist = '';
+
+// 解析 LRC 歌词文本为 [{ time: 秒, text: "歌词行" }] 数组
+function parseLRC(lrcText) {
+  if (!lrcText) return null;
+  const lines = [];
+  const raw = lrcText.split('\n');
+  // 匹配 [mm:ss.xx] 或 [mm:ss] 格式
+  const timeRe = /\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]/g;
+  for (let i = 0; i < raw.length; i++) {
+    const line = raw[i].trim();
+    if (!line) continue;
+    let match;
+    const times = [];
+    while ((match = timeRe.exec(line)) !== null) {
+      const min = parseInt(match[1], 10);
+      const sec = parseInt(match[2], 10);
+      const ms = match[3] ? parseInt(match[3].padEnd(3, '0'), 10) : 0;
+      times.push(min * 60 + sec + ms / 1000);
+    }
+    // 去掉时间标签后的纯文本
+    const text = line.replace(timeRe, '').trim();
+    if (times.length === 0) continue;
+    for (let t = 0; t < times.length; t++) {
+      lines.push({ time: times[t], text: text });
+    }
+  }
+  if (lines.length === 0) return null;
+  // 按时间排序
+  lines.sort((a, b) => a.time - b.time);
+  return lines;
+}
+
+// 根据当前播放秒数找到对应的歌词行索引
+function findLyricIndex(lines, currentTime) {
+  if (!lines || lines.length === 0) return -1;
+  let idx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].time <= currentTime) {
+      idx = i;
+    } else {
+      break;
+    }
+  }
+  return idx;
+}
+
+// 在页面注入 fetch 拦截器，捕获歌词和歌曲信息请求
+function injectFetchInterceptor() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.executeJavaScript(`
+    (function(){
+      if (window.__fnLyricInterceptor) return;
+      window.__fnLyricInterceptor = true;
+
+      var origFetch = window.fetch;
+      window.fetch = function(){
+        var url = arguments[0];
+        if (typeof url === 'object' && url.url) url = url.url;
+        url = String(url);
+
+        var args = arguments;
+        return origFetch.apply(this, args).then(function(resp){
+          try {
+            // 拦截歌词请求：/api/v1/lyric/list?trackGUID=xxx
+            if (url.indexOf('lyric/list') !== -1) {
+              resp.clone().text().then(function(body){
+                try {
+                  var data = JSON.parse(body);
+                  if (data.code === 0 && data.data && data.data.list && data.data.list.length > 0) {
+                    // 取第一个歌词（可能有多个版本）
+                    var lyric = data.data.list[0];
+                    var trackGUID = (url.match(/trackGUID=([^&]+)/) || [])[1] || '';
+                    window.__fnCurrentLyric = {
+                      trackGUID: trackGUID,
+                      content: lyric.content || '',
+                      source: lyric.source
+                    };
+                  }
+                } catch {}
+              }).catch(function(){});
+            }
+
+            // 拦截歌曲元数据请求：/api/v1/track/metadata?guid=xxx
+            if (url.indexOf('track/metadata') !== -1) {
+              resp.clone().text().then(function(body){
+                try {
+                  var data = JSON.parse(body);
+                  if (data.code === 0 && data.data && data.data.track) {
+                    var track = data.data.track;
+                    window.__fnCurrentTrack = {
+                      guid: track.guid,
+                      title: track.title || '',
+                      duration: track.duration || 0,
+                      artists: (track.artists || []).map(function(a){ return a.name; }).join(' / '),
+                      album: (track.album || {}).name || ''
+                    };
+                  }
+                } catch {}
+              }).catch(function(){});
+            }
+          } catch {}
+          return resp;
+        });
+      };
+    })();
+  `).catch(() => {});
+}
+
+function startLyricPolling() {
+  if (lyricPollTimer) clearInterval(lyricPollTimer);
+  currentTrackGUID = null;
+  currentLyricRaw = null;
+  currentLyricLines = null;
+  currentSongTitle = '';
+  currentSongArtist = '';
+
+  // 注入 fetch 拦截器（有守卫，不会重复注入）
+  injectFetchInterceptor();
+
+  // 每 500ms 轮询播放进度和歌词
+  lyricPollTimer = setInterval(() => {
+    if (!mainWindow || mainWindow.isDestroyed() || !lyricWindow || lyricWindow.isDestroyed()) return;
+    let currentUrl = '';
+    try { currentUrl = mainWindow.webContents.getURL(); } catch {}
+    if (!/^https?:/i.test(currentUrl)) return;
+
+    mainWindow.webContents.executeJavaScript(`
+      (function(){
+        // 1. 读取播放进度：input.music-player-progress-input
+        var input = document.querySelector('.music-player-progress-input');
+        var currentTime = 0, duration = 0;
+        if (input) {
+          currentTime = parseFloat(input.value) || 0;
+          duration = parseFloat(input.max) || 0;
+        }
+
+        // 2. 检测播放状态
+        var playing = !!document.querySelector('button[aria-label="暂停"]');
+
+        // 3. 读取拦截器缓存的歌词和歌曲信息
+        var lyric = window.__fnCurrentLyric || null;
+        var track = window.__fnCurrentTrack || null;
+
+        // 4. 读取歌曲标题（从底部播放栏，作为后备）
+        var songTitle = '';
+        var titleEl = document.querySelector('.music-player-glass [class*="title"]');
+        if (titleEl) songTitle = (titleEl.textContent || '').trim();
+
+        // 5. 如果没有歌词缓存，主动从已有 track 信息获取 GUID 并请求歌词
+        if (!lyric && !window.__fnFetchingLyric) {
+          // 优先从拦截器缓存的 track 信息获取 GUID
+          var guid = (track && track.guid) ? track.guid : '';
+
+          // 后备：从 URL 获取
+          if (!guid) {
+            var urlMatch = location.pathname.match(/track[\\/\\/]([a-zA-Z0-9]+)/);
+            guid = urlMatch ? urlMatch[1] : '';
+          }
+
+          if (guid) {
+            window.__fnFetchingLyric = true;
+            // 主动调用歌词API
+            fetch('/music/api/v1/lyric/list?trackGUID=' + encodeURIComponent(guid))
+              .then(function(r){ return r.text(); })
+              .then(function(body){
+                try {
+                  var data = JSON.parse(body);
+                  if (data.code === 0 && data.data && data.data.list && data.data.list.length > 0) {
+                    var l = data.data.list[0];
+                    window.__fnCurrentLyric = {
+                      trackGUID: guid,
+                      content: l.content || '',
+                      source: l.source
+                    };
+                  } else {
+                    // 没有歌词数据，标记为空避免反复请求
+                    window.__fnCurrentLyric = { trackGUID: guid, content: '', source: '' };
+                  }
+                } catch(e) {
+                  window.__fnCurrentLyric = { trackGUID: guid, content: '', source: '' };
+                }
+                window.__fnFetchingLyric = false;
+              })
+              .catch(function(){
+                window.__fnFetchingLyric = false;
+              });
+          }
+        }
+
+        // 返回可能被拦截器或主动请求更新的数据
+        lyric = window.__fnCurrentLyric || null;
+        track = window.__fnCurrentTrack || null;
+
+        return JSON.stringify({
+          currentTime: currentTime,
+          duration: duration,
+          playing: playing,
+          lyricContent: lyric ? lyric.content : null,
+          lyricTrackGUID: lyric ? lyric.trackGUID : null,
+          trackGUID: track ? track.guid : '',
+          trackTitle: track ? track.title : '',
+          trackArtists: track ? track.artists : '',
+          trackDuration: track ? track.duration : 0,
+          songTitle: songTitle
+        });
+      })();
+    `).then((json) => {
+      if (!json || !lyricWindow || lyricWindow.isDestroyed()) return;
+      try {
+        const data = JSON.parse(json);
+
+        // 检测歌曲切换：trackGUID 变化或歌词内容变化
+        const newGUID = data.trackGUID || data.lyricTrackGUID;
+        if (newGUID && newGUID !== currentTrackGUID) {
+          currentTrackGUID = newGUID;
+          currentLyricRaw = data.lyricContent || null;
+          currentLyricLines = parseLRC(currentLyricRaw);
+          currentSongTitle = data.trackTitle || data.songTitle || '';
+          currentSongArtist = data.trackArtists || '';
+        } else if (!currentLyricRaw && data.lyricContent) {
+          // 首次获取到歌词（主动请求返回了）
+          currentLyricRaw = data.lyricContent;
+          currentLyricLines = parseLRC(currentLyricRaw);
+          if (!currentSongTitle) {
+            currentSongTitle = data.trackTitle || data.songTitle || '';
+            currentSongArtist = data.trackArtists || '';
+          }
+        } else if (currentLyricRaw === '' && data.lyricContent) {
+          // 之前标记为空但后来有歌词了
+          currentLyricRaw = data.lyricContent;
+          currentLyricLines = parseLRC(currentLyricRaw);
+        }
+
+        // 如果歌词为空字符串，说明该歌曲没有歌词
+        const hasLyric = currentLyricLines && currentLyricLines.length > 0;
+
+        // 根据播放进度匹配歌词行
+        let current = '', prev = '', next = '';
+        if (hasLyric) {
+          const idx = findLyricIndex(currentLyricLines, data.currentTime);
+          if (idx >= 0) {
+            current = currentLyricLines[idx].text;
+            if (idx > 0) prev = currentLyricLines[idx - 1].text;
+            if (idx < currentLyricLines.length - 1) next = currentLyricLines[idx + 1].text;
+          } else {
+            // 还没到第一行歌词的时间
+            if (currentLyricLines.length > 0) next = currentLyricLines[0].text;
+          }
+        } else if (currentSongTitle) {
+          // 没有歌词时显示歌曲名
+          current = currentSongTitle;
+        }
+
+        lyricWindow.webContents.send('lyric-update', {
+          current: current,
+          prev: prev,
+          next: next,
+          playing: data.playing,
+          title: currentSongTitle,
+          artist: currentSongArtist
+        });
+      } catch {}
+    }).catch(() => {});
+  }, 500);
+}
+
+function stopLyricPolling() {
+  if (lyricPollTimer) {
+    clearInterval(lyricPollTimer);
+    lyricPollTimer = null;
+  }
+}
+
+// 桌面歌词控制按钮：在主窗口页面点击播放控制
+function handleLyricControl(action) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const arr = JSON.stringify(action);
+  mainWindow.webContents.executeJavaScript(`
+    (function(){
+      var action = ${arr};
+      function clickBtn(labels){
+        for (var i = 0; i < labels.length; i++) {
+          var b = document.querySelector('button[aria-label="' + labels[i] + '"], [role="button"][aria-label="' + labels[i] + '"]');
+          if (b) { b.click(); return true; }
+        }
+        return false;
+      }
+      if (action === 'prev') {
+        clickBtn(['上一首', '上一步', '上一曲', 'prev', 'previous']);
+      } else if (action === 'next') {
+        clickBtn(['下一首', '下一步', '下一曲', 'next', 'next']);
+      } else if (action === 'play-pause') {
+        var pauseBtn = document.querySelector('button[aria-label="暂停"]');
+        var playBtn = document.querySelector('button[aria-label="播放"]');
+        if (pauseBtn) pauseBtn.click();
+        else if (playBtn) playBtn.click();
+        else {
+          var a = document.querySelector('audio');
+          if (a) { if (a.paused) a.play(); else a.pause(); }
+        }
+      }
+    })();
+  `).catch(() => {});
+}
+
+// IPC: 切换桌面歌词
+ipcMain.handle('toggle-desktop-lyric', () => {
+  toggleDesktopLyric();
+  return desktopLyricEnabled;
+});
+
+// IPC: 桌面歌词控制按钮
+ipcMain.handle('lyric-control', (_event, action) => {
+  handleLyricControl(action);
+  return true;
+});
+
+// IPC: 关闭桌面歌词
+ipcMain.handle('close-desktop-lyric', () => {
+  hideDesktopLyric();
+  return true;
+});
+
+// IPC: 请求当前歌词（桌面歌词窗口初始化时调用）
+ipcMain.handle('request-lyrics', () => {
+  // 不做特殊处理，轮询会自动发送
+  return true;
+});
 
 // 基准窗口高度（在该高度下页面竖直方向无滚动条）
 const BASE_HEIGHT = 1150;
@@ -1316,6 +1772,12 @@ function createWindow() {
     if (!/^https?:/i.test(currentUrl)) return; // 仅对远程服务器页面注入
     // 置顶状态持久：SPA 不整页刷新时注入脚本不重复执行（有 id 守卫），先同步状态
     mainWindow.webContents.send('pin-changed', mainWindow.isAlwaysOnTop());
+    // 诊断：转发页面 console.log 到主进程 stdout
+    mainWindow.webContents.on('console-message', (_e, _level, message) => {
+      if (message && message.indexOf('[NET DIAG') === 0) {
+        console.log(message);
+      }
+    });
     mainWindow.webContents.insertCSS(`
       body { -webkit-app-region: no-drag; }
       /* 隐藏页面自带的「设置/用户」悬浮胶囊（功能已移入标题栏）：
@@ -1632,6 +2094,9 @@ function createWindow() {
     tryClickStartupNav();
     tryAutoPlay();
     tryAutoLogin();
+
+    // 注入 fetch 拦截器，捕获歌词和歌曲信息请求（桌面歌词功能依赖）
+    injectFetchInterceptor();
   });
 
   // SPA 路由切换（如 cookie 失效跳到 /login，或自动登录后跳回主页）
@@ -2163,6 +2628,15 @@ function buildTrayMenu() {
     },
     { type: 'separator' },
     {
+      label: '桌面歌词',
+      type: 'checkbox',
+      checked: desktopLyricEnabled,
+      click: (menuItem) => {
+        toggleDesktopLyric();
+      }
+    },
+    { type: 'separator' },
+    {
       label: '退出登录',
       click: () => {
         logoutAccount();
@@ -2305,6 +2779,14 @@ if (!gotTheLock) {
     createWindow();
     // 启动后延迟 3 秒异步检测更新（不阻塞窗口显示），仅弹窗一次
     setTimeout(checkUpdateAndNotify, 3000);
+    // 恢复桌面歌词状态：上次开启过则自动打开
+    desktopLyricEnabled = getDesktopLyricEnabled();
+    if (desktopLyricEnabled) {
+      // 延迟 2 秒等待主窗口页面加载完成
+      setTimeout(() => {
+        if (desktopLyricEnabled) showDesktopLyric();
+      }, 2000);
+    }
 
     app.on('activate', () => {
       // macOS 点击 dock 图标时，若窗口被隐藏则重新显示
@@ -2333,9 +2815,14 @@ app.on('window-all-closed', () => {
   }
 });
 
-// 真正退出时销毁托盘图标
+// 真正退出时销毁托盘图标与桌面歌词窗口
 app.on('before-quit', () => {
   isQuitting = true;
+  stopLyricPolling();
+  if (lyricWindow && !lyricWindow.isDestroyed()) {
+    lyricWindow.destroy();
+    lyricWindow = null;
+  }
   if (tray) {
     tray.destroy();
     tray = null;
