@@ -635,7 +635,7 @@ function createLyricWindow() {
   const cfg = readConfig();
   let x = cfg.lyricX;
   let y = cfg.lyricY;
-  const w = 720, h = 160;
+  const w = 720, h = 180;
   if (typeof x !== 'number' || typeof y !== 'number') {
     x = Math.round(workArea.x + (workArea.width - w) / 2);
     y = Math.round(workArea.y + workArea.height - h - 80);
@@ -669,6 +669,9 @@ function createLyricWindow() {
   lyricWindow.loadFile(path.join(__dirname, 'desktop-lyric.html'));
   lyricWindow.once('ready-to-show', () => {
     lyricWindow.show();
+    // 下发当前字体大小
+    const c = readConfig();
+    lyricWindow.webContents.send('lyric-font-size', c.lyricFontSize || 28);
   });
 
   // 拖动结束后保存位置
@@ -1066,6 +1069,18 @@ ipcMain.handle('close-desktop-lyric', () => {
 ipcMain.handle('request-lyrics', () => {
   // 不做特殊处理，轮询会自动发送
   return true;
+});
+
+// IPC: 设置歌词字体大小（持久化）
+ipcMain.handle('lyric-set-font-size', (_e, size) => {
+  const s = Math.max(14, Math.min(60, parseInt(size, 10) || 28));
+  const cfg = readConfig();
+  cfg.lyricFontSize = s;
+  writeConfig(cfg);
+  if (lyricWindow && !lyricWindow.isDestroyed()) {
+    lyricWindow.webContents.send('lyric-font-size', s);
+  }
+  return s;
 });
 
 // 基准窗口高度（在该高度下页面竖直方向无滚动条）

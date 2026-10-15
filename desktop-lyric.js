@@ -4,12 +4,24 @@
   var container = document.getElementById('container');
   var content = document.getElementById('lyric-content');
   var btnLock = document.getElementById('btn-lock');
+  var btnFontUp = document.getElementById('btn-font-up');
+  var btnFontDown = document.getElementById('btn-font-down');
   var btnClose = document.getElementById('btn-close');
   var btnPrev = document.getElementById('btn-prev');
   var btnPlay = document.getElementById('btn-play');
   var btnNext = document.getElementById('btn-next');
 
   var locked = false;
+  var fontSize = 28; // 默认字体大小，会被主进程下发的值覆盖
+
+  // 应用字体大小到 CSS 变量
+  function applyFontSize() {
+    document.documentElement.style.setProperty('--lyric-font-size', fontSize + 'px');
+    var emptyEls = content.querySelectorAll('.lyric-line.empty');
+    for (var i = 0; i < emptyEls.length; i++) {
+      emptyEls[i].style.fontSize = Math.round(fontSize * 0.75) + 'px';
+    }
+  }
 
   function render(data) {
     // data: { current: string, prev: string, next: string, playing: bool }
@@ -55,6 +67,26 @@
     btnLock.style.color = locked ? '#6ab0ff' : '#ccc';
   });
 
+  // 字体放大
+  btnFontUp.addEventListener('click', function () {
+    if (fontSize >= 60) return;
+    fontSize += 2;
+    applyFontSize();
+    if (window.desktopLyricBridge && window.desktopLyricBridge.setFontSize) {
+      window.desktopLyricBridge.setFontSize(fontSize);
+    }
+  });
+
+  // 字体缩小
+  btnFontDown.addEventListener('click', function () {
+    if (fontSize <= 14) return;
+    fontSize -= 2;
+    applyFontSize();
+    if (window.desktopLyricBridge && window.desktopLyricBridge.setFontSize) {
+      window.desktopLyricBridge.setFontSize(fontSize);
+    }
+  });
+
   btnClose.addEventListener('click', function () {
     if (window.desktopLyricBridge && window.desktopLyricBridge.close) {
       window.desktopLyricBridge.close();
@@ -83,6 +115,15 @@
   if (window.desktopLyricBridge && window.desktopLyricBridge.onUpdate) {
     window.desktopLyricBridge.onUpdate(function (data) {
       render(data);
+      applyFontSize(); // render 后重新应用字体大小（empty 行需要）
+    });
+  }
+
+  // 接收主进程下发的字体大小
+  if (window.desktopLyricBridge && window.desktopLyricBridge.onFontSize) {
+    window.desktopLyricBridge.onFontSize(function (size) {
+      fontSize = size;
+      applyFontSize();
     });
   }
 

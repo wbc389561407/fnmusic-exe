@@ -6,6 +6,9 @@
   <title>桌面歌词</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    html {
+      --lyric-font-size: 28px;
+    }
     html, body {
       height: 100%;
       overflow: hidden;
@@ -20,9 +23,11 @@
       flex-direction: column;
       align-items: center;
       justify-content: center;
+      position: relative;
       -webkit-app-region: drag;
       cursor: move;
       padding: 8px 16px;
+      background: rgba(0, 0, 0, 0.01);
     }
     #container.locked {
       -webkit-app-region: no-drag;
@@ -30,7 +35,7 @@
     }
     .lyric-line {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", Roboto, sans-serif;
-      font-size: 28px;
+      font-size: var(--lyric-font-size, 28px);
       font-weight: 700;
       line-height: 1.6;
       text-align: center;
@@ -58,50 +63,63 @@
       font-size: 22px;
       opacity: 0.5;
     }
-    /* 控制条 */
+    /* 控制条：歌词正下方，hover 整个区域时显示 */
     #toolbar {
-      position: fixed;
-      top: 2px;
-      right: 4px;
-      display: none;
-      gap: 2px;
+      margin-top: 10px;
+      display: flex;
+      gap: 6px;
       -webkit-app-region: no-drag;
       z-index: 999;
+      opacity: 0;
+      transition: opacity 0.2s;
     }
     #container:hover #toolbar {
-      display: flex;
+      opacity: 1;
     }
     .tb-btn {
-      width: 22px;
-      height: 22px;
+      width: 36px;
+      height: 36px;
       display: flex;
       align-items: center;
       justify-content: center;
       cursor: pointer;
       color: #ccc;
-      background: rgba(0,0,0,0.35);
+      background: rgba(0,0,0,0.5);
       border: none;
-      border-radius: 4px;
+      border-radius: 6px;
       transition: background 0.15s, color 0.15s;
     }
     .tb-btn:hover {
-      background: rgba(255,255,255,0.2);
+      background: rgba(255,255,255,0.3);
       color: #fff;
     }
     .tb-btn svg {
-      width: 12px;
-      height: 12px;
+      width: 18px;
+      height: 18px;
       display: block;
     }
   </style>
 </head>
 <body>
   <div id="container">
+    <div id="lyric-content">
+      <div class="lyric-line empty">桌面歌词已开启</div>
+    </div>
     <div id="toolbar">
       <div class="tb-btn" id="btn-lock" title="锁定/解锁拖动">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
           <rect x="5" y="11" width="14" height="10" rx="2"/>
           <path d="M8 11V7a4 4 0 0 1 8 0v4"/>
+        </svg>
+      </div>
+      <div class="tb-btn" id="btn-font-down" title="字体缩小">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 7V5h6v2M7 5v6m0 0l-2.5 5M7 11l2.5 5M14 19h7M17.5 16v6"/>
+        </svg>
+      </div>
+      <div class="tb-btn" id="btn-font-up" title="字体放大">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 7V5h6v2M7 5v6m0 0l-2.5 5M7 11l2.5 5M14 19h7M17.5 14v8"/>
         </svg>
       </div>
       <div class="tb-btn" id="btn-prev" title="上一首">
@@ -118,9 +136,6 @@
           <line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/>
         </svg>
       </div>
-    </div>
-    <div id="lyric-content">
-      <div class="lyric-line empty">桌面歌词已开启</div>
     </div>
   </div>
 

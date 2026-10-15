@@ -45,7 +45,11 @@ contextBridge.exposeInMainWorld('desktopLyricBridge', {
   // 播放控制：prev / next / play-pause
   control: (action) => ipcRenderer.invoke('lyric-control', action),
   // 关闭桌面歌词
-  close: () => ipcRenderer.invoke('close-desktop-lyric')
+  close: () => ipcRenderer.invoke('close-desktop-lyric'),
+  // 设置字体大小（持久化），参数为像素值
+  setFontSize: (size) => ipcRenderer.invoke('lyric-set-font-size', size),
+  // 监听字体大小变化（创建窗口时主进程下发初始值）
+  onFontSize: (cb) => ipcRenderer.on('lyric-font-size', (_e, size) => cb(size))
 });
 
 // 阻止页面默认拖拽打开文件的行为
