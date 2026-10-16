@@ -133,7 +133,7 @@ npm run dist:portable
 
 ## 版本号
 
-当前版本：**v3.2.0**
+当前版本：**v3.2.1**
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)（Semantic Versioning）：
 
@@ -146,6 +146,20 @@ npm run dist:portable
 版本号同步维护在 [package.json](package.json) 的 `version` 字段。
 
 ## 更新日志
+
+### v3.2.1
+
+- 性能优化：大幅降低长时间运行的 CPU 占用
+
+  - 播放状态轮询：窗口最小化到托盘时自动停止，恢复时立即同步；轮询间隔从 1.5s 放宽至 2s
+
+  - 桌面歌词：从每 500ms 跨进程 IPC 轮询改为本地读秒方案，播放时零 IPC，每 5s 低频校正一次；暂停时完全停止读秒，恢复时自动对齐
+
+  - MutationObserver 合并：5 个独立的全文档 Observer 合并为 1 个，加 400ms 防抖批量执行，DOM 变更时不再叠加 5 次全文档扫描
+
+  - 播放栏贴底校准：删除每秒一次的 `getBoundingClientRect` 强制 reflow，改由统一 Observer 在 DOM 变更时触发
+
+  - 访问码看门狗：通过门禁页后立即 `clearInterval`，不再残留空转定时器
 
 ### v3.2.0
 
