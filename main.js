@@ -1504,7 +1504,11 @@ function tryAutoAccessCode() {
           }
           return;
         }
-        if (!isGatePage()) return;
+        if (!isGatePage()) {
+          // 已离开门禁页（访问码正确，页面已跳转）→ 停止看门狗
+          clearInterval(timer);
+          return;
+        }
         var now = Date.now();
         if (lastSubmitAt && now - lastSubmitAt < RETRY_AFTER_MS) return; // 等页面跳转
         if (submitGate()) {
@@ -1723,6 +1727,10 @@ function createWindow() {
   let lastPlaying = null;
   function pollPlayingState() {
     if (!mainWindow || mainWindow.isDestroyed()) return;
+    // 仅在远程服务器页面轮询播放状态，设置页等本地页面无播放器
+    let currentUrl = '';
+    try { currentUrl = mainWindow.webContents.getURL(); } catch {}
+    if (!/^https?:/i.test(currentUrl)) return;
     mainWindow.webContents.executeJavaScript(`
       (function(){
         if (document.querySelector('button[aria-label="暂停"]')) return true;
@@ -1737,7 +1745,17 @@ function createWindow() {
     }).catch(() => {});
   }
   updateThumbar(false);
-  setInterval(pollPlayingState, 1500);
+  // 仅在窗口可见时轮询播放状态（隐藏/最小化到托盘时停止，避免空转浪费 CPU）
+  let pollTimer = null;
+  function startPolling() {
+    if (pollTimer) return;
+    pollTimer = setInterval(pollPlayingState, 2000);
+  }
+  function stopPolling() {
+    if (!pollTimer) return;
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
   mainWindow = new BrowserWindow({  width: winWidth,
     height: winHeight,
     minWidth: 900,
@@ -1769,10 +1787,18 @@ function createWindow() {
   mainWindow.on('show', () => {
     lastPlaying = null;
     pollPlayingState();
+    startPolling();
   });
   mainWindow.on('restore', () => {
     lastPlaying = null;
     pollPlayingState();
+    startPolling();
+  });
+  mainWindow.on('hide', () => {
+    stopPolling();
+  });
+  mainWindow.on('minimize', () => {
+    stopPolling();
   });
 
   mainWindow.once('ready-to-show', () => {
@@ -1949,15 +1975,8 @@ function createWindow() {
             p.style.setProperty('visibility', 'hidden', 'important');
           }
         }
+        window.__fnHideDock = hideDock;
         hideDock();
-        if (!window.__fnHideDockObs) {
-          window.__fnHideDockObs = true;
-          var ht = null;
-          new MutationObserver(function(){
-            if (ht) clearTimeout(ht);
-            ht = setTimeout(hideDock, 300);
-          }).observe(document.body, { childList: true, subtree: true });
-        }
         // 歌曲列表最后几首会被底部悬浮播放栏遮住：找 data-index 最大的行注入 padding-bottom 100px
         function fixLayout(){
           // 给最后一首歌（data-index 最大）注入 padding-bottom，滑过播放栏
@@ -1972,20 +1991,33 @@ function createWindow() {
             last.style.setProperty('padding-bottom', '100px', 'important');
           }
         }
+        window.__fnFixLayout = fixLayout;
         fixLayout();
-        if (!window.__fnShrinkObs) {
-          window.__fnShrinkObs = true;
-          var t = null;
-          new MutationObserver(function(){
-            if (t) clearTimeout(t);
-            t = setTimeout(fixLayout, 300);
-          }).observe(document.body, { childList: true, subtree: true });
+        // 统一 DOM 变更监听：合并 5 个 MutationObserver 为 1 个，防抖 400ms 后批量执行
+        if (!window.__fnDomObserverStarted) {
+          window.__fnDomObserverStarted = true;
+          var __fnDebounceTimer = null;
+          function __fnOnDomChange(){
+            if (__fnDebounceTimer) clearTimeout(__fnDebounceTimer);
+            __fnDebounceTimer = setTimeout(function(){
+              __fnDebounceTimer = null;
+              if (window.__fnHideDock) window.__fnHideDock();
+              if (window.__fnFixLayout) window.__fnFixLayout();
+              if (window.__fnHideRecent) window.__fnHideRecent();
+              if (window.__fnHideLogout) window.__fnHideLogout();
+              if (window.__fnReportPlaylists) window.__fnReportPlaylists();
+              if (window.__fnStickBottom) window.__fnStickBottom();
+            }, 400);
+          }
+          new MutationObserver(__fnOnDomChange).observe(document.body, {
+            childList: true, subtree: true
+          });
         }
       })();
     `).catch(() => {});
     // 隐藏首页「最近添加」歌曲模块（保留「最近添加」专辑模块）
     // 区分依据：歌曲模块标题为「最近添加歌曲」，专辑模块标题为「最近添加专辑」
-    // SPA 异步渲染，用 MutationObserver 持续隐藏
+    // SPA 异步渲染，由统一 DOM Observer 防抖调用
     mainWindow.webContents.executeJavaScript(`
       (function(){
         if (window.__fnHideRecentStarted) return;
@@ -2002,10 +2034,8 @@ function createWindow() {
             }
           }
         }
+        window.__fnHideRecent = hideRecent;
         hideRecent();
-        new MutationObserver(hideRecent).observe(document.documentElement, {
-          childList: true, subtree: true
-        });
       })();
     `).catch(() => {});
 
@@ -2039,13 +2069,14 @@ function createWindow() {
           if (rt) clearTimeout(rt);
           rt = setTimeout(stickBottom, 200);
         });
-        // 兜底周期校准（幂等：目标不变时不会重写）
-        setInterval(stickBottom, 1000);
+        // 注册到统一 DOM Observer：DOM 变更（页面切换/播放器重渲染）时防抖校准
+        // 替代原来的 setInterval(stickBottom, 1000)，避免每秒强制 reflow
+        window.__fnStickBottom = stickBottom;
       })();
     `).catch(() => {});
 
     // 隐藏页面内「退出登录」按钮（避免误触退出，登录态由本应用托管）
-    // 该按钮用 Tailwind 通用类无唯一标识，按文本内容匹配；SPA 异步渲染，用 MutationObserver 持续隐藏
+    // 该按钮用 Tailwind 通用类无唯一标识，按文本内容匹配；SPA 异步渲染，由统一 DOM Observer 防抖调用
     mainWindow.webContents.executeJavaScript(`
       (function(){
         if (window.__fnHideLogoutStarted) return;
@@ -2059,15 +2090,14 @@ function createWindow() {
             }
           }
         }
+        window.__fnHideLogout = hideLogout;
         hideLogout();
-        new MutationObserver(hideLogout).observe(document.documentElement, {
-          childList: true, subtree: true
-        });
       })();
     `).catch(() => {});
 
     // 持续读取侧边栏自定义歌单列表并上报主进程（供托盘菜单展示）
     // 歌单按钮特征：button 内含封面 img（src 带 coverId=playlist_）和名称 span
+    // 由统一 DOM Observer 防抖调用
     mainWindow.webContents.executeJavaScript(`
       (function(){
         if (window.__fnPlaylistObserverStarted) return;
@@ -2101,12 +2131,8 @@ function createWindow() {
             }
           } catch {}
         }
+        window.__fnReportPlaylists = report;
         report();
-        var timer = null;
-        new MutationObserver(function(){
-          if (timer) return;
-          timer = setTimeout(function(){ timer = null; report(); }, 500);
-        }).observe(document.documentElement, { childList: true, subtree: true });
       })();
     `).catch(() => {});
 
