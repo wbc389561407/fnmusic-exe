@@ -133,7 +133,7 @@ npm run dist:portable
 
 ## 版本号
 
-当前版本：**v3.2.1**
+当前版本：**v3.2.2**
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)（Semantic Versioning）：
 
@@ -146,6 +146,14 @@ npm run dist:portable
 版本号同步维护在 [package.json](package.json) 的 `version` 字段。
 
 ## 更新日志
+
+### v3.2.2
+
+- 修复桌面歌词字体放大/缩小时工具栏被顶出窗口的问题
+
+  - 歌词窗口高度固定为 180px，字体变大后内容溢出，`justify-content: center` 居中布局导致下方工具栏被顶出可视区域
+
+  - 新增窗口高度自适应：字体变化或歌词行数变化时，渲染层测量容器实际内容高度（含歌词区与工具栏），通过新增的 `lyric-resize` IPC 通知主进程动态调整窗口高度（限制 80–600px），底框随字体一起变大变小
 
 ### v3.2.1
 
