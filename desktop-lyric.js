@@ -21,6 +21,20 @@
     for (var i = 0; i < emptyEls.length; i++) {
       emptyEls[i].style.fontSize = Math.round(fontSize * 0.75) + 'px';
     }
+    requestResize();
+  }
+
+  // 测量容器实际内容高度并通知主进程调整窗口高度
+  // 字体变大变小时底框一起变大变小，避免工具栏被顶出窗口外
+  function requestResize() {
+    requestAnimationFrame(function () {
+      var h = container.scrollHeight;
+      if (h > 0) {
+        if (window.desktopLyricBridge && window.desktopLyricBridge.resize) {
+          window.desktopLyricBridge.resize(h);
+        }
+      }
+    });
   }
 
   function render(data) {
@@ -52,6 +66,7 @@
         btnPlay.title = '播放';
       }
     }
+    requestResize();
   }
 
   function escapeHtml(s) {

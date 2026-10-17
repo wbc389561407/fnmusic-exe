@@ -49,7 +49,9 @@ contextBridge.exposeInMainWorld('desktopLyricBridge', {
   // 设置字体大小（持久化），参数为像素值
   setFontSize: (size) => ipcRenderer.invoke('lyric-set-font-size', size),
   // 监听字体大小变化（创建窗口时主进程下发初始值）
-  onFontSize: (cb) => ipcRenderer.on('lyric-font-size', (_e, size) => cb(size))
+  onFontSize: (cb) => ipcRenderer.on('lyric-font-size', (_e, size) => cb(size)),
+  // 请求主进程调整歌词窗口高度（字体变化 / 歌词行数变化时调用）
+  resize: (height) => ipcRenderer.invoke('lyric-resize', height)
 });
 
 // 阻止页面默认拖拽打开文件的行为

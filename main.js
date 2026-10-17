@@ -1117,6 +1117,14 @@ ipcMain.handle('lyric-set-font-size', (_e, size) => {
   return s;
 });
 
+// IPC: 桌面歌词窗口自适应高度（底框随字体/行数一起变大变小，避免工具栏被顶出去）
+ipcMain.handle('lyric-resize', (_e, height) => {
+  if (!lyricWindow || lyricWindow.isDestroyed()) return;
+  const h = Math.max(80, Math.min(600, Math.round(Number(height) || 180)));
+  const [w] = lyricWindow.getSize();
+  lyricWindow.setSize(w, h);
+});
+
 // 基准窗口高度（在该高度下页面竖直方向无滚动条）
 const BASE_HEIGHT = 1150;
 // 三档窗口尺寸预设
